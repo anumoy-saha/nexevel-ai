@@ -1,463 +1,613 @@
-import React, { useState, useRef, useEffect } from "react";
-var CE = React.createElement;
+import React, { useState, useEffect, useRef } from "react";
 
-// ─── utils ────────────────────────────────────────────────────────────────────
-function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { } }
-function load(k) { try { var v = localStorage.getItem(k); if (v) return JSON.parse(v); } catch (e) { } return null; }
-function cpCopy(t, s) { var el = document.createElement("textarea"); el.value = t; el.style.cssText = "position:fixed;top:-9999px;opacity:0"; document.body.appendChild(el); el.focus(); el.select(); try { document.execCommand("copy"); s(true); setTimeout(function () { s(false); }, 2000); } catch (e) { } document.body.removeChild(el); }
-function CopyBtn(p) { var s = useState(false); var ok = s[0]; var set = s[1]; function go() { try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(p.text).then(function () { set(true); setTimeout(function () { set(false); }, 2000); }).catch(function () { cpCopy(p.text, set); }); } else { cpCopy(p.text, set); } } catch (e) { cpCopy(p.text, set); } } return CE("button", { onClick: go, style: { background: ok ? "rgba(16,185,129,0.2)" : "rgba(139,92,246,0.15)", color: ok ? "#10b981" : "#a78bfa", border: "1px solid " + (ok ? "rgba(16,185,129,0.4)" : "rgba(139,92,246,0.3)"), borderRadius: 6, padding: p.small ? "2px 8px" : "5px 12px", cursor: "pointer", fontSize: p.small ? 10 : 12, fontWeight: 600, whiteSpace: "nowrap", transition: "all .2s", backdropFilter: "blur(8px)" } }, ok ? "✓ Copied" : p.label || "Copy"); }
+var h = React.createElement;
 
-// ─── API ──────────────────────────────────────────────────────────────────────
-async function callClaude(sys, msg, onChunk, maxTok) {
-  maxTok = maxTok || 8000;
-  var res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTok, system: sys, stream: true, messages: [{ role: "user", content: msg }] }) });
-  if (!res.ok) throw new Error("API " + res.status + ": " + (await res.text()));
-  var reader = res.body.getReader(); var dec = new TextDecoder(); var full = "";
-  while (true) { var chunk = await reader.read(); if (chunk.done) break; var lines = dec.decode(chunk.value, { stream: true }).split("\n"); for (var i = 0; i < lines.length; i++) { var line = lines[i]; if (line.indexOf("data: ") !== 0) continue; var d = line.slice(6).trim(); if (d === "[DONE]") continue; try { var j = JSON.parse(d); if (j.type === "content_block_delta" && j.delta && j.delta.type === "text_delta") { full += j.delta.text; onChunk(full); } } catch (e) { } } }
-  return full;
+// ─── in-memory stores (replace with DB calls in production) ──────────────────
+var _users = [];
+var _projects = []; // { id, userId, name, createdAt, rawPrompt, refinedPrompt, spec, plan, files, demoConfig, stage, log }
+
+// ─── storage helpers ──────────────────────────────────────────────────────────
+function saveProject(proj) {
+  var idx = _projects.findIndex(function(p){ return p.id === proj.id; });
+  if (idx >= 0) _projects[idx] = proj;
+  else _projects.push(proj);
 }
-async function continueCode(sys, partial, onChunk) {
-  try { var res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 8000, system: sys, stream: true, messages: [{ role: "user", content: "Write the complete code." }, { role: "assistant", content: partial }, { role: "user", content: "Continue exactly from where you stopped. Do not repeat anything." }] }) }); if (!res.ok) return ""; var reader = res.body.getReader(); var dec = new TextDecoder(); var full = ""; while (true) { var chunk = await reader.read(); if (chunk.done) break; var lines = dec.decode(chunk.value, { stream: true }).split("\n"); for (var i = 0; i < lines.length; i++) { var line = lines[i]; if (line.indexOf("data: ") !== 0) continue; var d = line.slice(6).trim(); if (d === "[DONE]") continue; try { var j = JSON.parse(d); if (j.type === "content_block_delta" && j.delta && j.delta.type === "text_delta") { full += j.delta.text; onChunk(full); } } catch (e) { } } } return full; } catch (e) { return ""; }
-}
-async function callClaudeComplete(sys, msg, onChunk, maxTok) {
-  var full = await callClaude(sys, msg, onChunk, maxTok || 8000);
-  var open = (full.match(/```/g) || []).length;
-  if (open % 2 !== 0) { var cont = await continueCode(sys, full, function (t) { onChunk(full + t); }); full = full + cont; }
-  return full;
-}
-function extractHTML(t) { var m = t.match(/```html\s*([\s\S]*?)```/i); return m ? m[1].trim() : null; }
-function extractBlock(t, lang) { var m = t.match(new RegExp("```" + lang + "\\s*([\\s\\S]*?)```", "i")); return m ? m[1].trim() : null; }
+function getProjects(userId) { return _projects.filter(function(p){ return p.userId === userId; }); }
+function getProject(id) { return _projects.find(function(p){ return p.id === id; }) || null; }
+function newProjectId() { return "proj_" + Date.now() + "_" + Math.random().toString(36).slice(2,7); }
 
-
-var BIZ = [
-  { id: "shop", e: "🛍️", label: "Shop / Retail", color: "#818cf8", hint: "Retail POS with inventory, billing, customers, analytics" },
-  { id: "restaurant", e: "🍽️", label: "Restaurant / Café", color: "#f59e0b", hint: "Restaurant POS with table mgmt, menu, KDS, billing" },
-  { id: "agency", e: "🏢", label: "Agency / SaaS", color: "#a78bfa", hint: "Agency ERP with CRM, projects, invoicing, HR" },
-  { id: "school", e: "🎓", label: "School / Education", color: "#10b981", hint: "School ERP with admissions, fees, attendance, grades" },
-  { id: "transport", e: "🚛", label: "Transport / Fleet", color: "#38bdf8", hint: "Fleet ERP with vehicles, trips, drivers, billing" },
-  { id: "pharmacy", e: "💊", label: "Pharmacy / Clinic", color: "#f87171", hint: "Pharmacy POS with medicines, expiry, prescriptions, billing" },
-];
-
-// ─── PROMPTS ──────────────────────────────────────────────────────────────────
-var REFINE_SYS = "You are a senior CTO. Convert the user's raw idea into a concise software specification for a POS/ERP system. Cover: project name, core modules (max 5), database tables with fields, API routes, tech stack (React+Vite+TypeScript frontend, Node+Express+Prisma+PostgreSQL backend). Keep it under 300 words. End with: SPEC COMPLETE.";
-
-var PLAN_SYS = "You are a React architect. Given a software spec, output a JSON array of files. IMPORTANT: Keep it to MAX 12 files. Focus only on the most critical files. Each: {path, description, type, category} where category is frontend|backend|database|config. Respond ONLY with a valid JSON array. No explanation.";
-
-function makeCodeSys(spec, filePath, fileType, cat, allPaths) {
-  var ormNote = filePath.indexOf("prisma") !== -1
-    ? "\n- For schema.prisma: complete models with all relations, enums, indexes\n- For seed.js: use the PrismaClient class from the prisma package"
-    : "";
-  return "You are a senior " + (cat === "frontend" ? "React/TypeScript" : "Node.js") + " developer.\n\nSPEC:\n" + spec.slice(0, 800) + "\n\nOTHER FILES:\n" + allPaths.join(", ") + "\n\nWrite COMPLETE working code for: " + filePath + " (" + fileType + ")\n\nRULES:\n- Output ONLY a fenced code block with correct language tag\n- Write EVERY line — zero placeholders or TODOs\n- Keep functions short and focused\n- React: TypeScript interfaces, hooks, Tailwind classes\n- Backend routes: full Express handler logic inline, use prisma ORM\n- IMPORTANT: A working 150-line file beats a broken 500-line file" + ormNote;
-}
-
-var PHASES = [
-  { id: "idle", icon: "◎", label: "Ready", color: "#818cf8" },
-  { id: "refine", icon: "◈", label: "Refining Prompt", color: "#a78bfa" },
-  { id: "plan", icon: "◉", label: "Planning", color: "#818cf8" },
-  { id: "coding", icon: "◌", label: "Writing Code", color: "#f59e0b" },
-  { id: "docker", icon: "◍", label: "Dockerizing", color: "#38bdf8" },
-  { id: "demo", icon: "◎", label: "Building Demo", color: "#10b981" },
-  { id: "done", icon: "●", label: "Complete", color: "#10b981" },
-];
-function fIcon(t) { return ({ tsx: "⚛", ts: "⟨⟩", js: "{}", jsx: "⚛", css: "~", json: "{}", sql: "⬡", md: "≡", sh: "$", yaml: "⌘", prisma: "◈", env: "⚿" })[t] || "◻"; }
-function sColor(s) { return ({ pending: "#374151", writing: "#f59e0b", done: "#10b981", error: "#ef4444" })[s]; }
-
-// ─── GLOBAL STYLES ────────────────────────────────────────────────────────────
-var GCSS = `
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-*{box-sizing:border-box;margin:0;padding:0;}
-::-webkit-scrollbar{width:3px;height:3px;}
-::-webkit-scrollbar-track{background:transparent;}
-::-webkit-scrollbar-thumb{background:rgba(139,92,246,0.3);border-radius:10px;}
-@keyframes spin{to{transform:rotate(360deg)}}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-@keyframes glow{0%,100%{box-shadow:0 0 20px rgba(139,92,246,0.3)}50%{box-shadow:0 0 60px rgba(139,92,246,0.6),0 0 100px rgba(99,102,241,0.3)}}
-@keyframes float{0%,100%{transform:translateY(0px)}50%{transform:translateY(-12px)}}
-@keyframes particleFloat{0%{transform:translate(0,0) scale(1);opacity:0.6}25%{transform:translate(30px,-40px) scale(1.2);opacity:1}50%{transform:translate(-20px,-80px) scale(0.8);opacity:0.7}75%{transform:translate(40px,-120px) scale(1.1);opacity:0.4}100%{transform:translate(10px,-160px) scale(0.5);opacity:0}}
-@keyframes scanline{0%{transform:translateY(-100%)}100%{transform:translateY(100vh)}}
-@keyframes gradientShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-@keyframes borderGlow{0%,100%{box-shadow:0 0 0 1px rgba(139,92,246,0.3),0 0 20px rgba(139,92,246,0.1)}50%{box-shadow:0 0 0 1px rgba(139,92,246,0.8),0 0 40px rgba(139,92,246,0.3),0 0 80px rgba(99,102,241,0.15)}}
-@keyframes typewriter{from{width:0}to{width:100%}}
-@keyframes blink{0%,50%{border-color:transparent}51%,100%{border-color:#a78bfa}}
-@keyframes ripple{0%{transform:scale(0);opacity:0.8}100%{transform:scale(4);opacity:0}}
-@keyframes fadeSlideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
-@keyframes neuralPulse{0%{stroke-dashoffset:1000}100%{stroke-dashoffset:0}}
-@keyframes orbitRotate{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
-textarea:focus,input:focus{outline:none;}
-body{font-family:'Inter',sans-serif;}
-`;
-
-// ─── ANIMATED BG CANVAS ──────────────────────────────────────────────────────
-function NeuralBG() {
-  var canvasRef = useRef(null);
-  useEffect(function () {
-    var canvas = canvasRef.current; if (!canvas) return;
-    var ctx = canvas.getContext("2d");
-    var W = canvas.width = window.innerWidth;
-    var H = canvas.height = window.innerHeight;
-    var nodes = []; var NUM = 60;
-    for (var i = 0; i < NUM; i++) { nodes.push({ x: Math.random() * W, y: Math.random() * H, vx: (Math.random() - .5) * .4, vy: (Math.random() - .5) * .4, r: Math.random() * 2 + 1 }); }
-    var raf;
-    function draw() {
-      ctx.clearRect(0, 0, W, H);
-      for (var i = 0; i < NUM; i++) {
-        var n = nodes[i];
-        n.x += n.vx; n.y += n.vy;
-        if (n.x < 0 || n.x > W) n.vx *= -1;
-        if (n.y < 0 || n.y > H) n.vy *= -1;
-        for (var j = i + 1; j < NUM; j++) {
-          var m = nodes[j];
-          var dx = n.x - m.x, dy = n.y - m.y, dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < 140) {
-            ctx.beginPath();
-            ctx.strokeStyle = "rgba(139,92,246," + (1 - dist / 140) * 0.15 + ")";
-            ctx.lineWidth = 0.5;
-            ctx.moveTo(n.x, n.y); ctx.lineTo(m.x, m.y); ctx.stroke();
-          }
-        }
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(139,92,246,0.4)";
-        ctx.fill();
-      }
-      raf = requestAnimationFrame(draw);
-    }
-    draw();
-    function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
-    window.addEventListener("resize", resize);
-    return function () { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
-  }, []);
-  return CE("canvas", { ref: canvasRef, style: { position: "fixed", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 0 } });
-}
-
-// ─── FLOATING PARTICLES ───────────────────────────────────────────────────────
-function Particles() {
-  var parts = [];
-  for (var i = 0; i < 12; i++) {
-    parts.push({
-      left: Math.random() * 100 + "%",
-      bottom: "0",
-      animDelay: Math.random() * 8 + "s",
-      animDur: (6 + Math.random() * 6) + "s",
-      size: (3 + Math.random() * 4) + "px",
-      color: ["#a78bfa", "#818cf8", "#38bdf8", "#10b981", "#f59e0b"][Math.floor(Math.random() * 5)],
-    });
-  }
-  return CE("div", { style: { position: "fixed", inset: 0, pointerEvents: "none", zIndex: 1, overflow: "hidden" } },
-    parts.map(function (p, i) {
-      return CE("div", { key: i, style: { position: "absolute", left: p.left, bottom: p.bottom, width: p.size, height: p.size, borderRadius: "50%", background: p.color, animation: "particleFloat " + p.animDur + " ease-in-out " + p.animDelay + " infinite", opacity: .6, boxShadow: "0 0 6px " + p.color } });
+// ─── Claude API (non-streaming, goes through /api/chat in production) ─────────
+async function callClaude(system, userMessage, maxTokens) {
+  var res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: maxTokens || 4000,
+      system: system,
+      stream: false,
+      messages: [{ role: "user", content: userMessage }]
     })
+  });
+  if (!res.ok) {
+    var err = await res.text();
+    throw new Error("API " + res.status + ": " + err.slice(0, 300));
+  }
+  var data = await res.json();
+  return (data.content || []).map(function(b){ return b.text || ""; }).join("");
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+function extractCodeBlock(text, lang) {
+  if (!text) return "";
+  if (lang) {
+    var re = new RegExp("```" + lang + "[\\t ]*\\n([\\s\\S]*?)```", "i");
+    var m = text.match(re);
+    if (m) return m[1].trim();
+  }
+  var any = text.match(/```[\w]*[\t ]*\n([\s\S]*?)```/);
+  if (any) return any[1].trim();
+  return text.trim();
+}
+function extractJSON(text, isArray) {
+  try {
+    var pat = isArray ? /\[[\s\S]*\]/ : /\{[\s\S]*\}/;
+    var m = text.match(pat);
+    if (m) return JSON.parse(m[0]);
+  } catch(e) {}
+  return null;
+}
+function copyText(text) {
+  return new Promise(function(resolve) {
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(function(){ resolve(true); }).catch(function(){ resolve(false); });
+    else resolve(false);
+  });
+}
+function ts() { return new Date().toLocaleTimeString(); }
+
+// ─── prompts ──────────────────────────────────────────────────────────────────
+var REFINE_SYS = `You are an expert AI product manager and prompt engineer.
+Your job is to take a raw user idea and transform it into a clear, structured, professional software prompt.
+
+Output a JSON object:
+{
+  "refinedPrompt": "A clear 3-5 sentence description of exactly what to build, who it's for, and what problem it solves",
+  "appName": "Short catchy name",
+  "category": "POS|ERP|CRM|LMS|HMS|FMS|Other",
+  "keyFeatures": ["feature1","feature2","feature3","feature4","feature5"],
+  "targetUsers": "Who will use this",
+  "problemSolved": "What pain point this addresses"
+}
+
+Make the refinedPrompt specific, actionable, and technically precise. Output ONLY the JSON.`;
+
+var SPEC_SYS = `You are a senior CTO. Given a refined software prompt, produce a detailed technical specification.
+
+Output these exact sections:
+## Project Name
+## Overview (3-4 sentences)
+## Target Users
+## Core Modules
+## Database Schema (tables and key fields)
+## API Endpoints
+## Pages/Screens
+## Tech Stack
+
+Be specific to the actual domain. Under 350 words total.`;
+
+var PLAN_SYS = `You are a software architect. Given a spec, output a JSON array of 8-12 files to build this app.
+Each item: { "path": "...", "type": "tsx|ts|js|json|prisma|md", "category": "Frontend|Backend|Database|Config|Docs", "description": "..." }
+Must include: prisma schema, seed file, express server, main React component, package.json, README.
+Add domain-specific route files and page components.
+Output ONLY the valid JSON array.`;
+
+function FILE_SYS(filePath, fileType, desc, spec, refinedPrompt) {
+  var rules = {
+    tsx: "Write a complete React functional component with hooks and Tailwind CSS. Use real entity names from the spec.",
+    ts: "Write complete TypeScript with proper types matching the spec entities.",
+    js: "Write complete Node.js/CommonJS. For Express routes use full inline handlers with Prisma client.",
+    json: "Output valid JSON with realistic versions.",
+    prisma: "Write complete Prisma schema with all models, fields, and relations. Use postgresql datasource.",
+    md: "Write comprehensive markdown documentation for this project.",
+    sql: "Write SQL DDL and seed INSERT statements."
+  }[fileType] || "Write complete code.";
+  return `You are writing a real production file for a software application.
+
+REFINED PROMPT: ${refinedPrompt}
+
+SPEC:
+${spec}
+
+FILE: ${filePath}
+PURPOSE: ${desc}
+
+RULES: ${rules}
+Use ACTUAL entity names from the spec — no generic placeholders.
+OUTPUT: A single fenced code block with the correct language tag. No prose.`;
+}
+
+var DEMO_SYS = `You output JSON demo configurations. Output ONLY valid JSON, no markdown, no prose.
+
+Given an app idea and spec, create a demo config:
+{
+  "appName": "Name",
+  "primary": { "name": "Singular", "plural": "Plural", "emoji": "emoji", "fields": [{"key":"k","label":"L","type":"text|number|select"}] },
+  "secondary": { "name": "Singular", "plural": "Plural", "emoji": "emoji", "fields": [...] },
+  "transaction": { "name": "Singular", "plural": "Plural", "verb": "Verb" },
+  "navItems": [{"id":"dashboard","label":"Dashboard","icon":"📊"}, ...],
+  "primaryColor": "#hexcolor",
+  "primaryData": [12 realistic records],
+  "secondaryData": [6 realistic records],
+  "stats": [{"label":"Stat1"},{"label":"Stat2"},{"label":"Stat3"},{"label":"Stat4"}]
+}
+All data must be domain-specific and realistic.`;
+
+// ─── demo HTML builder ────────────────────────────────────────────────────────
+function buildDemoHTML(config) {
+  var c = config || {};
+  var color = c.primaryColor || "#6366f1";
+  var primary = c.primary || { name:"Item",plural:"Items",emoji:"📦",fields:[{key:"name",label:"Name",type:"text"}] };
+  var secondary = c.secondary || { name:"Customer",plural:"Customers",emoji:"👥",fields:[{key:"name",label:"Name",type:"text"}] };
+  var transaction = c.transaction || { name:"Order",plural:"Orders",verb:"Create" };
+  var navItems = c.navItems || [{id:"dashboard",label:"Dashboard",icon:"📊"},{id:"primary",label:primary.plural,icon:primary.emoji},{id:"secondary",label:secondary.plural,icon:secondary.emoji},{id:"transactions",label:transaction.plural,icon:"📋"},{id:"reports",label:"Reports",icon:"📈"}];
+  var primaryData = (c.primaryData||[]).map(function(it,i){return Object.assign({id:i+1},it);});
+  var secondaryData = (c.secondaryData||[]).map(function(it,i){return Object.assign({id:i+1},it);});
+  var stats = c.stats||[{label:"Revenue"},{label:"Total "+primary.plural},{label:"Total "+secondary.plural},{label:"Pending"}];
+  var appName = c.appName||"App";
+  var dp = {primary:primaryData,secondary:secondaryData,primaryFields:primary.fields||[],secondaryFields:secondary.fields||[],primaryName:primary.name,primaryPlural:primary.plural,secondaryName:secondary.name,secondaryPlural:secondary.plural,txName:transaction.name,txPlural:transaction.plural,txVerb:transaction.verb,stats:stats,color:color};
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${appName}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,sans-serif}body{background:#f1f5f9;color:#1e293b;display:flex;height:100vh;overflow:hidden}.sidebar{width:230px;background:#0f172a;color:#fff;padding:20px 0;display:flex;flex-direction:column;flex-shrink:0}.logo{padding:0 20px 20px;border-bottom:1px solid #1e293b;font-size:16px;font-weight:800}.nav-item{padding:11px 20px;cursor:pointer;font-size:13px;color:#cbd5e1;border-left:3px solid transparent;transition:all .2s}.nav-item:hover{background:rgba(255,255,255,.05)}.nav-item.active{background:rgba(99,102,241,.15);border-left-color:${color};color:#fff}.main{flex:1;display:flex;flex-direction:column;overflow:hidden}.topbar{padding:16px 24px;background:#fff;border-bottom:1px solid #e2e8f0;font-size:20px;font-weight:700}.content{flex:1;overflow-y:auto;padding:20px 24px}.page{display:none}.page.active{display:block}.btn{padding:7px 14px;border:none;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600}.btn-primary{background:${color};color:#fff}.btn-secondary{background:#e2e8f0;color:#1e293b}.btn-success{background:#10b981;color:#fff}.btn-danger{background:#ef4444;color:#fff}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}.stat-card{background:#fff;padding:18px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.06)}.stat-card .label{font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600}.stat-card .value{font-size:26px;font-weight:800;margin-top:6px}.charts-grid{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:20px}.chart-card{background:#fff;padding:18px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.06)}.chart-card h3{font-size:13px;font-weight:700;margin-bottom:12px}.card{background:#fff;padding:18px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.06);margin-bottom:14px}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;padding:9px 10px;background:#f8fafc;color:#475569;font-weight:600;font-size:11px;text-transform:uppercase}td{padding:10px;border-bottom:1px solid #f1f5f9}.search-bar{display:flex;gap:8px;margin-bottom:14px;align-items:center}.search-bar input{flex:1;padding:8px 12px;border:1px solid #e2e8f0;border-radius:7px;font-size:13px}.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center}.modal.active{display:flex}.modal-content{background:#fff;border-radius:14px;padding:22px;max-width:480px;width:90%;max-height:85vh;overflow-y:auto}.field{margin-bottom:12px}.field label{display:block;font-size:11px;font-weight:600;margin-bottom:5px;color:#475569}.field input,.field select{width:100%;padding:9px;border:1px solid #e2e8f0;border-radius:7px;font-size:13px}.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.toast{position:fixed;bottom:20px;right:20px;background:#1e293b;color:#fff;padding:12px 18px;border-radius:10px;z-index:2000;font-size:13px;animation:si .3s ease}@keyframes si{from{transform:translateX(400px)}to{transform:translateX(0)}}.toast.success{background:#10b981}.toast.error{background:#ef4444}.action-btn{padding:4px 9px;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:600;margin-right:4px}.action-edit{background:#e0e7ff;color:#3730a3}.action-del{background:#fee2e2;color:#991b1b}.action-view{background:#dcfce7;color:#166534}.empty{text-align:center;color:#94a3b8;padding:36px}.badge{padding:2px 9px;border-radius:12px;font-size:10px;font-weight:600;display:inline-block}.badge-completed{background:#dcfce7;color:#166634}.badge-pending{background:#fef3c7;color:#92400e}.badge-cancelled{background:#fee2e2;color:#991b1b}</style></head><body>
+<aside class="sidebar"><div class="logo">${primary.emoji||"⚡"} ${appName}</div>
+${navItems.map(function(ni){return`<div class="nav-item${ni.id==="dashboard"?" active":""}" data-page="${ni.id}" onclick="showPage('${ni.id}')">${ni.icon} ${ni.label}</div>`;}).join("")}
+</aside>
+<main class="main"><div class="topbar" id="pageTitle">Dashboard</div><div class="content">
+${navItems.map(function(pi){return`<div id="${pi.id}" class="page${pi.id==="dashboard"?" active":""}"></div>`;}).join("")}
+</div></main>
+<div id="modal" class="modal"><div class="modal-content" id="modalBody"></div></div>
+<script>
+var DATA=${JSON.stringify(dp)};
+var primary=DATA.primary,secondary=DATA.secondary,transactions=[],nextTxId=1100,charts={},txFilter="all";
+(function(){var st=["completed","completed","pending","completed","completed","cancelled","pending","completed"];for(var i=0;i<8;i++){var d=new Date();d.setDate(d.getDate()-i);var sec=secondary[i%Math.max(secondary.length,1)]||{name:"Customer"};var pri=primary[i%Math.max(primary.length,1)]||{name:"Item"};transactions.push({id:1000+i,ref:"TX-"+(1000+i),secondary:sec.name||sec.title||"Record "+(i+1),primary:pri.name||pri.title||"Item "+(i+1),amount:Math.round((Math.random()*200+20)*100)/100,status:st[i],date:d.toISOString()});}})();
+function money(n){return"$"+Number(n).toFixed(2);}
+function showToast(msg,type){var t=document.createElement("div");t.className="toast "+(type||"success");t.textContent=msg;document.body.appendChild(t);setTimeout(function(){t.remove();},3000);}
+function openModal(html){document.getElementById("modalBody").innerHTML=html;document.getElementById("modal").classList.add("active");}
+function closeModal(){document.getElementById("modal").classList.remove("active");}
+document.getElementById("modal").addEventListener("click",function(e){if(e.target.id==="modal")closeModal();});
+function showPage(id){document.querySelectorAll(".page").forEach(function(p){p.classList.remove("active");});var pg=document.getElementById(id);if(pg)pg.classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});var nav=document.querySelector("[data-page=\""+id+"\"]");if(nav)nav.classList.add("active");document.getElementById("pageTitle").textContent=id.charAt(0).toUpperCase()+id.slice(1);if(id==="dashboard")renderDashboard();else if(id==="primary")renderPrimary();else if(id==="secondary")renderSecondary();else if(id==="transactions")renderTx();else if(id==="reports")renderReports();else{var pg2=document.getElementById(id);if(pg2)pg2.innerHTML='<div class="card"><p style="color:#64748b">Module coming soon.</p></div>';}}
+function computeStat(label){var L=label.toLowerCase();if(L.indexOf("revenue")>=0||L.indexOf("sales")>=0||L.indexOf("earning")>=0)return money(transactions.filter(function(t){return t.status==="completed";}).reduce(function(s,t){return s+t.amount;},0));if(L.indexOf("pending")>=0)return transactions.filter(function(t){return t.status==="pending";}).length;if(L.indexOf("completed")>=0)return transactions.filter(function(t){return t.status==="completed";}).length;if(L.indexOf(DATA.primaryPlural.toLowerCase())>=0)return primary.length;if(L.indexOf(DATA.secondaryPlural.toLowerCase())>=0)return secondary.length;return transactions.length;}
+function renderDashboard(){var sh=DATA.stats.map(function(s){return'<div class="stat-card"><div class="label">'+s.label+'</div><div class="value">'+computeStat(s.label)+"</div></div>";}).join("");var recent=transactions.slice(0,5).map(function(t){return"<tr><td><b>"+t.ref+"</b></td><td>"+t.secondary+"</td><td>"+money(t.amount)+"</td><td><span class=\"badge badge-\"+t.status+\">"+t.status+"</span></td><td>"+new Date(t.date).toLocaleDateString()+"</td></tr>";}).join("");document.getElementById("dashboard").innerHTML='<div class="stats-grid">'+sh+'</div><div class="charts-grid"><div class="chart-card"><h3>Activity (7 Days)</h3><canvas id="c1" style="max-height:240px"></canvas></div><div class="chart-card"><h3>Status Mix</h3><canvas id="c2" style="max-height:240px"></canvas></div></div><div class="card"><h3 style="margin-bottom:12px">Recent '+DATA.txPlural+"</h3><table><thead><tr><th>Ref</th><th>"+DATA.secondaryName+"</th><th>Amount</th><th>Status</th><th>Date</th></tr></thead><tbody>"+recent+"</tbody></table></div>";setTimeout(initCharts,50);}
+function initCharts(){if(charts.c1)charts.c1.destroy();if(charts.c2)charts.c2.destroy();var x1=document.getElementById("c1");if(x1){var lab=[],dat=[];for(var i=6;i>=0;i--){var d=new Date();d.setDate(d.getDate()-i);lab.push(d.toLocaleDateString("en",{weekday:"short"}));dat.push(transactions.filter(function(t){return new Date(t.date).toDateString()===d.toDateString()&&t.status==="completed";}).reduce(function(s,t){return s+t.amount;},0));}charts.c1=new Chart(x1,{type:"bar",data:{labels:lab,datasets:[{label:"Activity",data:dat,backgroundColor:DATA.color,borderRadius:5}]},options:{responsive:true,plugins:{legend:{display:false}}}});}var x2=document.getElementById("c2");if(x2){var bs={completed:0,pending:0,cancelled:0};transactions.forEach(function(t){bs[t.status]=(bs[t.status]||0)+1;});charts.c2=new Chart(x2,{type:"doughnut",data:{labels:["Completed","Pending","Cancelled"],datasets:[{data:[bs.completed,bs.pending,bs.cancelled],backgroundColor:["#10b981","#f59e0b","#ef4444"]}]},options:{responsive:true}});}}
+function renderPrimary(){var pg=document.getElementById("primary");if(!pg)return;var ths=DATA.primaryFields.map(function(f){return"<th>"+f.label+"</th>";}).join("")+"<th>Actions</th>";pg.innerHTML='<div class="card"><div class="search-bar"><input type="text" placeholder="Search '+DATA.primaryPlural+'..." oninput="filterPrimary(this.value)"><button class="btn btn-primary" onclick="openPrimaryForm(null)">+ Add '+DATA.primaryName+"</button></div><table><thead><tr>"+ths+"</tr></thead><tbody id=\"ptbl\"></tbody></table></div>";filterPrimary("");}
+function filterPrimary(q){var tb=document.getElementById("ptbl");if(!tb)return;var f=primary.filter(function(p){return!q||Object.values(p).some(function(v){return String(v).toLowerCase().indexOf(q.toLowerCase())>=0;});});if(!f.length){tb.innerHTML='<tr><td colspan="99" class="empty">No records</td></tr>';return;}tb.innerHTML=f.map(function(p){var cells=DATA.primaryFields.map(function(fd){var v=p[fd.key];if(fd.type==="number"&&(fd.key.indexOf("price")>=0||fd.key.indexOf("amount")>=0||fd.key.indexOf("cost")>=0))v=money(v||0);return"<td>"+(v!==undefined?v:"—")+"</td>";}).join("");return"<tr>"+cells+'<td><button class="action-btn action-edit" onclick="openPrimaryForm('+p.id+')">Edit</button><button class="action-btn action-del" onclick="deletePrimary('+p.id+')">Del</button></td></tr>';}).join("");}
+function openPrimaryForm(id){var p=id?primary.find(function(x){return x.id===id;}):{}; if(!p)return;var fields=DATA.primaryFields.map(function(f){var v=p[f.key]!==undefined?p[f.key]:"";if(f.type==="select"&&f.options){var opts=f.options.map(function(o){return"<option"+(String(o)===String(v)?" selected":"")+">"+o+"</option>";}).join("");return'<div class="field"><label>'+f.label+"</label><select id=\"pf_"+f.key+'\">'+opts+"</select></div>";}return'<div class="field"><label>'+f.label+"</label><input id=\"pf_"+f.key+'\" type="'+(f.type==="number"?"number":"text")+'" value="'+v+'"></div>';}).join("");openModal("<h2 style=\"font-size:16px;margin-bottom:14px\">"+(id?"Edit":"Add")+" "+DATA.primaryName+"</h2>"+fields+'<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="savePrimary('+(id||"null")+')">Save</button></div>');}
+function savePrimary(id){var data={};DATA.primaryFields.forEach(function(f){var el=document.getElementById("pf_"+f.key);if(el)data[f.key]=f.type==="number"?(parseFloat(el.value)||0):el.value;});if(id){Object.assign(primary.find(function(x){return x.id===id;}),data);showToast("Updated","success");}else{data.id=primary.reduce(function(m,x){return Math.max(m,x.id||0);},0)+1;primary.push(data);showToast("Added","success");}closeModal();filterPrimary("");}
+function deletePrimary(id){if(!confirm("Delete?"))return;primary=primary.filter(function(x){return x.id!==id;});showToast("Deleted","success");filterPrimary("");}
+function renderSecondary(){var pg=document.getElementById("secondary");if(!pg)return;var ths=DATA.secondaryFields.map(function(f){return"<th>"+f.label+"</th>";}).join("")+"<th>Actions</th>";pg.innerHTML='<div class="card"><div class="search-bar"><input type="text" placeholder="Search '+DATA.secondaryPlural+'..." oninput="filterSecondary(this.value)"><button class="btn btn-primary" onclick="openSecondaryForm(null)">+ Add '+DATA.secondaryName+"</button></div><table><thead><tr>"+ths+"</tr></thead><tbody id=\"stbl\"></tbody></table></div>";filterSecondary("");}
+function filterSecondary(q){var tb=document.getElementById("stbl");if(!tb)return;var f=secondary.filter(function(p){return!q||Object.values(p).some(function(v){return String(v).toLowerCase().indexOf(q.toLowerCase())>=0;});});if(!f.length){tb.innerHTML='<tr><td colspan="99" class="empty">No records</td></tr>';return;}tb.innerHTML=f.map(function(p){var cells=DATA.secondaryFields.map(function(fd){var v=p[fd.key];return"<td>"+(v!==undefined?v:"—")+"</td>";}).join("");return"<tr>"+cells+'<td><button class="action-btn action-edit" onclick="openSecondaryForm('+p.id+')">Edit</button><button class="action-btn action-del" onclick="deleteSecondary('+p.id+')">Del</button></td></tr>';}).join("");}
+function openSecondaryForm(id){var p=id?secondary.find(function(x){return x.id===id;}):{}; if(!p)return;var fields=DATA.secondaryFields.map(function(f){var v=p[f.key]!==undefined?p[f.key]:"";return'<div class="field"><label>'+f.label+"</label><input id=\"sf_"+f.key+'\" type="'+(f.type==="number"?"number":"text")+'" value="'+v+'"></div>';}).join("");openModal("<h2 style=\"font-size:16px;margin-bottom:14px\">"+(id?"Edit":"Add")+" "+DATA.secondaryName+"</h2>"+fields+'<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveSecondary('+(id||"null")+')">Save</button></div>');}
+function saveSecondary(id){var data={};DATA.secondaryFields.forEach(function(f){var el=document.getElementById("sf_"+f.key);if(el)data[f.key]=f.type==="number"?(parseFloat(el.value)||0):el.value;});if(id){Object.assign(secondary.find(function(x){return x.id===id;}),data);showToast("Updated","success");}else{data.id=secondary.reduce(function(m,x){return Math.max(m,x.id||0);},0)+1;secondary.push(data);showToast("Added","success");}closeModal();filterSecondary("");}
+function deleteSecondary(id){if(!confirm("Delete?"))return;secondary=secondary.filter(function(x){return x.id!==id;});showToast("Deleted","success");filterSecondary("");}
+function renderTx(){var pg=document.getElementById("transactions");if(!pg)return;var btns=["all","completed","pending","cancelled"].map(function(s){return'<button class="btn '+(s===txFilter?"btn-primary":"btn-secondary")+'" onclick="setTxFilter(\''+s+'\')">'+s.charAt(0).toUpperCase()+s.slice(1)+"</button>";}).join("");pg.innerHTML='<div class="card"><div class="search-bar">'+btns+'<button class="btn btn-success" onclick="newTx()" style="margin-left:auto">+ '+DATA.txVerb+"</button></div><table><thead><tr><th>Ref</th><th>"+DATA.secondaryName+"</th><th>"+DATA.primaryName+"</th><th>Amount</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead><tbody id=\"txtbl\"></tbody></table></div>";refreshTx();}
+function setTxFilter(s){txFilter=s;renderTx();}
+function refreshTx(){var tb=document.getElementById("txtbl");if(!tb)return;var f=transactions.filter(function(t){return txFilter==="all"||t.status===txFilter;});tb.innerHTML=f.map(function(t){return"<tr><td><b>"+t.ref+"</b></td><td>"+t.secondary+"</td><td>"+t.primary+"</td><td>"+money(t.amount)+"</td><td><span class=\"badge badge-\"+t.status+\">"+t.status+"</span></td><td>"+new Date(t.date).toLocaleDateString()+"</td><td><button class=\"action-btn action-view\" onclick=\"viewTx("+t.id+\")\">View</button></td></tr>";}).join("");}
+function viewTx(id){var t=transactions.find(function(x){return x.id===id;});if(!t)return;var actions=t.status==="pending"?'<button class="btn btn-success" onclick="updateTx('+t.id+',\'completed\')">Complete</button><button class="btn btn-danger" onclick="updateTx('+t.id+',\'cancelled\')">Cancel</button>":"";openModal("<h2 style=\"font-size:16px;margin-bottom:14px\">"+t.ref+"</h2><p style=\"margin:7px 0\"><b>"+DATA.secondaryName+":</b> "+t.secondary+"</p><p style=\"margin:7px 0\"><b>"+DATA.primaryName+":</b> "+t.primary+"</p><p style=\"margin:7px 0\"><b>Amount:</b> "+money(t.amount)+"</p><p style=\"margin:7px 0\"><b>Status:</b> <span class=\"badge badge-\"+t.status+\">"+t.status+"</span></p>"+'<div class="modal-actions">'+actions+'<button class="btn btn-secondary" onclick="closeModal()">Close</button></div>' );}
+function updateTx(id,status){var t=transactions.find(function(x){return x.id===id;});if(t){t.status=status;showToast("Updated","success");closeModal();refreshTx();}}
+function newTx(){var pri=primary[0]||{name:"Item"};var sec=secondary[0]||{name:"Customer"};transactions.unshift({id:nextTxId++,ref:"TX-"+nextTxId,secondary:sec.name||sec.title||"Record",primary:pri.name||pri.title||"Item",amount:pri.price||Math.round(Math.random()*100+20),status:"pending",date:new Date().toISOString()});showToast(DATA.txVerb+"d!","success");refreshTx();}
+function renderReports(){var pg=document.getElementById("reports");if(!pg)return;var c=transactions.filter(function(t){return t.status==="completed";});var rev=c.reduce(function(s,t){return s+t.amount;},0);pg.innerHTML='<div class="stats-grid"><div class="stat-card"><div class="label">Revenue</div><div class="value">'+money(rev)+'</div></div><div class="stat-card"><div class="label">Completed</div><div class="value">'+c.length+'</div></div><div class="stat-card"><div class="label">Avg Order</div><div class="value">'+money(c.length?rev/c.length:0)+'</div></div><div class="stat-card"><div class="label">'+DATA.primaryPlural+'</div><div class="value">'+primary.length+'</div></div></div><div class="chart-card"><h3>Revenue Trend</h3><canvas id="rc" style="max-height:280px"></canvas></div>' ;setTimeout(initRevChart,50);} 
+function initRevChart(){if(charts.rev)charts.rev.destroy();var ctx=document.getElementById("rc");if(!ctx)return;var lab=[],dat=[];for(var i=6;i>=0;i--){var d=new Date();d.setDate(d.getDate()-i);lab.push(d.toLocaleDateString("en",{month:"short",day:"numeric"}));dat.push(transactions.filter(function(t){return new Date(t.date).toDateString()===d.toDateString()&&t.status==="completed";}).reduce(function(s,t){return s+t.amount;},0));}charts.rev=new Chart(ctx,{type:"line",data:{labels:lab,datasets:[{label:"Revenue",data:dat,borderColor:DATA.color,backgroundColor:DATA.color+"33",fill:true,tension:0.3,borderWidth:3}]},options:{responsive:true,plugins:{legend:{display:false}}}});} 
+renderDashboard();
+</script></body></html>`;
+}
+
+// ─── CSS ──────────────────────────────────────────────────────────────────────
+var CSS = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,-apple-system,sans-serif;background:#0a0817;color:#e2e8f0}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:rgba(139,92,246,0.3);border-radius:10px}@keyframes spin{to{transform:rotate(360deg)}}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes glow{0%,100%{box-shadow:0 0 20px rgba(139,92,246,0.3)}50%{box-shadow:0 0 40px rgba(139,92,246,0.6)}}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}input:focus,textarea:focus{outline:none}`;
+
+// ─── components ───────────────────────────────────────────────────────────────
+function Spinner(props) {
+  var s = props.size||14, c = props.color||"#a78bfa";
+  return h("div",{style:{width:s,height:s,border:"2px solid "+c,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",display:"inline-block",flexShrink:0}});
+}
+function CopyBtn(props) {
+  var st = useState(false); var copied=st[0],setCopied=st[1];
+  return h("button",{onClick:function(){copyText(props.text).then(function(ok){if(ok){setCopied(true);setTimeout(function(){setCopied(false);},2000);}});},style:{background:copied?"rgba(16,185,129,0.2)":"rgba(139,92,246,0.15)",color:copied?"#10b981":"#a78bfa",border:"1px solid "+(copied?"rgba(16,185,129,0.4)":"rgba(139,92,246,0.3)"),borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11,fontWeight:600}},copied?"Copied":props.label||"Copy");
+}
+
+// ─── Log entry component ──────────────────────────────────────────────────────
+function LogEntry(props) {
+  var entry = props.entry;
+  var colors = { info:"#a78bfa", success:"#10b981", error:"#ef4444", warn:"#f59e0b" };
+  var icons = { info:"ℹ", success:"✓", error:"✕", warn:"⚠" };
+  return h("div",{style:{display:"flex",gap:8,padding:"5px 0",borderBottom:"1px solid rgba(255,255,255,0.04)",fontSize:11}},
+    h("span",{style:{color:colors[entry.type]||"#a78bfa",flexShrink:0,fontWeight:700}},"["+ts()+"] "+icons[entry.type]),
+    h("span",{style:{color:"rgba(255,255,255,0.6)",fontFamily:"monospace"}},entry.msg)
   );
 }
 
-// ─── GLOWING INPUT WRAPPER ────────────────────────────────────────────────────
-function GlowInput(p) {
-  var f = useState(false); var focused = f[0]; var setFocused = f[1];
-  return CE("div", { style: { position: "relative", borderRadius: 16 } },
-    CE("div", { style: { position: "absolute", inset: -1, borderRadius: 17, background: "linear-gradient(135deg,#8b5cf6,#6366f1,#38bdf8,#8b5cf6)", backgroundSize: "300% 300%", animation: "gradientShift 4s ease infinite", opacity: focused ? 1 : 0.5, transition: "opacity .3s", zIndex: 0, padding: 1 } }),
-    CE("div", { style: { position: "absolute", inset: -2, borderRadius: 18, background: "linear-gradient(135deg,#8b5cf6,#6366f1,#38bdf8)", opacity: focused ? 0.4 : 0.15, filter: "blur(8px)", transition: "opacity .3s", zIndex: 0 } }),
-    CE("div", { style: { position: "relative", zIndex: 1, background: "rgba(10,8,30,0.9)", borderRadius: 16, backdropFilter: "blur(20px)" } },
-      p.children,
-      CE("div", { style: { position: "absolute", inset: 0, borderRadius: 16, pointerEvents: "none", border: "1px solid rgba(139,92,246," + (focused ? 0.8 : 0.3) + ")", transition: "border-color .3s" } })
-    ),
-    CE("div", { onFocus: function () { setFocused(true); }, onBlur: function () { setFocused(false); }, style: { position: "absolute", inset: 0, zIndex: 2, pointerEvents: "none" } })
-  );
-}
-
-var iStyle = { width: "100%", background: "transparent", border: "none", padding: "13px 16px", fontSize: 13.5, color: "#e2e8f0", fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" };
-
-// ─── MAIN APP ─────────────────────────────────────────────────────────────────
-export default function App() {
-  var _u = useState(function () { return load("nx_user"); }); var user = _u[0]; var setUser = _u[1];
-  var _as = useState("login"); var aScr = _as[0]; var setAScr = _as[1];
-  var _ae = useState(""); var aErr = _ae[0]; var setAErr = _ae[1];
-  var _al = useState(false); var aLoad = _al[0]; var setALoad = _al[1];
-  var _lf = useState({ email: "", password: "" }); var lf = _lf[0]; var setLf = _lf[1];
-  var _sf = useState({ name: "", email: "", password: "", confirm: "" }); var sf = _sf[0]; var setSf = _sf[1];
-
-  var _scr = useState("intro"); var screen = _scr[0]; var setScreen = _scr[1];
-  var _biz = useState(null); var selBiz = _biz[0]; var setSelBiz = _biz[1];
-  var _desc = useState(""); var desc = _desc[0]; var setDesc = _desc[1];
-  var _phase = useState("idle"); var phase = _phase[0]; var setPhase = _phase[1];
-  var _msgs = useState([]); var msgs = _msgs[0]; var setMsgs = _msgs[1];
-  var _inp = useState(""); var inp = _inp[0]; var setInp = _inp[1];
-  var _st = useState(""); var sText = _st[0]; var setSText = _st[1];
-  var _sl = useState(""); var sLabel = _sl[0]; var setSLabel = _sl[1];
-  var _files = useState([]); var files = _files[0]; var setFiles = _files[1];
-  var _af = useState(null); var activeFile = _af[0]; var setActiveFile = _af[1];
-  var _dhtml = useState(""); var demoHTML = _dhtml[0]; var setDemoHTML = _dhtml[1];
-  var _srcd = useState(""); var srcdoc = _srcd[0]; var setSrcdoc = _srcd[1];
-  var _atab = useState("chat"); var atab = _atab[0]; var setAtab = _atab[1];
-  var _err = useState(""); var error = _err[0]; var setError = _err[1];
-  var _att = useState([]); var atts = _att[0]; var setAtts = _att[1];
-  var _dock = useState([]); var dockFiles = _dock[0]; var setDockFiles = _dock[1];
-  var _spec = useState(""); var rSpec = _spec[0]; var setRSpec = _spec[1];
-
-  var bottomRef = useRef(null);
-  var fileInputRef = useRef(null);
-
-  useEffect(function () { if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior: "smooth" }); }, [msgs, sText]);
-
-  function getUsers() { return load("nx_users") || []; }
-  function doLogin(e) { if (e && e.preventDefault) e.preventDefault(); setAErr(""); setALoad(true); setTimeout(function () { var us = getUsers(); var f = null; for (var i = 0; i < us.length; i++) { if (us[i].email === lf.email && us[i].password === lf.password) { f = us[i]; break; } } if (!f) { setAErr("Invalid email or password."); setALoad(false); return; } setUser(f); save("nx_user", f); setALoad(false); }, 800); }
-  function doSignup(e) { if (e && e.preventDefault) e.preventDefault(); setAErr(""); if (!sf.name.trim()) { setAErr("Name required."); return; } if (sf.email.indexOf("@") < 0) { setAErr("Valid email required."); return; } if (sf.password.length < 6) { setAErr("Password min 6 chars."); return; } if (sf.password !== sf.confirm) { setAErr("Passwords do not match."); return; } setALoad(true); setTimeout(function () { var us = getUsers(); for (var i = 0; i < us.length; i++) { if (us[i].email === sf.email) { setAErr("Email already registered."); setALoad(false); return; } } var nu = { id: Date.now().toString(), name: sf.name.trim(), email: sf.email.trim(), password: sf.password }; us.push(nu); save("nx_users", us); setUser(nu); save("nx_user", nu); setALoad(false); }, 800); }
-  function doLogout() { setUser(null); save("nx_user", null); setScreen("intro"); setPhase("idle"); setMsgs([]); }
-  function addMsg(c, l, p) { setMsgs(function (prev) { return prev.concat([{ role: "assistant", content: c, label: l, phase: p }]); }); }
-
-  var busy = phase !== "idle" && phase !== "done";
-  var curPhase = null; for (var pi = 0; pi < PHASES.length; pi++) { if (PHASES[pi].id === phase) { curPhase = PHASES[pi]; break; } }
-
-  function handleFileAttach(e) { var sel = Array.from(e.target.files); sel.forEach(function (file) { var r = new FileReader(); r.onload = function (ev) { setAtts(function (p) { return p.concat([{ name: file.name, type: file.type, dataUrl: ev.target.result }]); }); }; r.readAsDataURL(file); }); e.target.value = ""; }
-  function removeAtt(i) { setAtts(function (p) { return p.filter(function (_, j) { return j !== i; }); }); }
-
-  async function run(rawIdea) {
-    setError(""); setFiles([]); setDockFiles([]); setDemoHTML(""); setSrcdoc(""); setActiveFile(null); setAtab("chat");
-    var biz = null; for (var i = 0; i < BIZ.length; i++) { if (BIZ[i].id === selBiz) { biz = BIZ[i]; break; } }
-    var ctx = biz ? "Business: " + biz.label + " (" + biz.e + ")\n" : "";
-
-    setPhase("refine"); setSLabel("Refining your idea into a pro spec...");
-    var spec = "";
-    try { spec = await callClaude(REFINE_SYS, ctx + "Raw idea: " + rawIdea, function (t) { setSText(t); }, 6000); }
-    catch (e) { setError("Refine: " + e.message); setPhase("idle"); setSText(""); return; }
-    setSText(""); setRSpec(spec);
-    addMsg("Prompt refined into a professional React + PostgreSQL specification.", "✍ Refined Spec", "refine");
-
-    setPhase("plan"); setSLabel("Planning complete file structure...");
-    var planRaw = "";
-    try { planRaw = await callClaude(PLAN_SYS, "Spec:\n" + spec, function (t) { setSText(t); }, 4000); }
-    catch (e) { setError("Plan: " + e.message); setPhase("idle"); setSText(""); return; }
-    setSText("");
-    var fp = [];
-    try { fp = JSON.parse(planRaw.replace(/```json|```/g, "").trim()); if (!Array.isArray(fp)) throw new Error(); }
-    catch (e) {
-      fp = [
-        { path: "src/main.tsx", description: "React entry point", type: "tsx", category: "frontend", priority: 1 },
-        { path: "src/App.tsx", description: "Root app with router", type: "tsx", category: "frontend", priority: 1 },
-        { path: "src/pages/DashboardPage.tsx", description: "Dashboard with KPI cards and charts", type: "tsx", category: "frontend", priority: 1 },
-        { path: "src/pages/POSPage.tsx", description: "POS billing with cart", type: "tsx", category: "frontend", priority: 1 },
-        { path: "src/pages/InventoryPage.tsx", description: "Inventory CRUD", type: "tsx", category: "frontend", priority: 1 },
-        { path: "src/pages/OrdersPage.tsx", description: "Orders management", type: "tsx", category: "frontend", priority: 1 },
-        { path: "src/store/cartStore.ts", description: "Zustand cart store", type: "ts", category: "frontend", priority: 1 },
-        { path: "backend/server.js", description: "Express server", type: "js", category: "backend", priority: 1 },
-        { path: "backend/controllers/product.controller.js", description: "Product CRUD", type: "js", category: "backend", priority: 1 },
-        { path: "prisma/schema.prisma", description: "Full Prisma schema", type: "prisma", category: "database", priority: 1 },
-        { path: "prisma/seed.js", description: "Seed with 20+ records", type: "js", category: "database", priority: 1 },
-        { path: "docker-compose.yml", description: "Docker services", type: "yaml", category: "config", priority: 1 },
-      ];
-    }
-    fp.sort(function (a, b) { return (a.priority || 1) - (b.priority || 1); });
-    addMsg("Planned " + fp.length + " files across React, Node.js, PostgreSQL, Docker.", "◉ File Plan", "plan");
-    var init = fp.map(function (f) { return Object.assign({}, f, { code: "", status: "pending" }); });
-    setFiles(init);
-
-    setPhase("coding");
-    var done = init.slice();
-    for (var fi = 0; fi < fp.length; fi++) {
-      var f = fp[fi];
-      setSLabel("Writing " + f.path + " (" + (fi + 1) + "/" + fp.length + ")");
-      (function (idx) { setFiles(function (p) { return p.map(function (x, ii) { return ii === idx ? Object.assign({}, x, { status: "writing" }) : x; }); }); })(fi);
-      setActiveFile(fi); if (fi === 0) setAtab("files");
-      var sys = makeCodeSys(spec, fp, f.path, f.type, f.category || "frontend");
-      var fc = "";
-      try { fc = await callClaudeComplete(sys, "Write complete production code for: " + f.path + "\nBusiness: " + ctx + "Purpose: " + f.description, function (t) { setSText(t); }, 8000); }
-      catch (e) { (function (idx, msg) { setFiles(function (p) { return p.map(function (x, ii) { return ii === idx ? Object.assign({}, x, { status: "error", code: "// Error: " + msg }) : x; }); }); })(fi, e.message); setSText(""); continue; }
-      setSText("");
-      var lm = { tsx: "tsx", ts: "typescript", js: "javascript", css: "css", json: "json", sql: "sql", md: "markdown", sh: "bash", yaml: "yaml", prisma: "prisma", env: "bash" };
-      var ex = extractBlock(fc, lm[f.type] || f.type) || extractBlock(fc, "typescript") || extractBlock(fc, "javascript") || fc;
-      var df = Object.assign({}, f, { code: ex, status: "done" });
-      done[fi] = df;
-      (function (idx, d) { setFiles(function (p) { return p.map(function (x, ii) { return ii === idx ? d : x; }); }); })(fi, df);
-    }
-    addMsg("All " + fp.length + " files written.", "◌ Code Complete", "coding");
-
-    setPhase("docker"); setSLabel("Generating Docker deployment...");
-    var DOCKER_SYS = "Generate a Docker deployment package for React+Node+PostgreSQL. Output each file as ### filename header then fenced code block: ### docker-compose.yml ### Dockerfile.frontend ### Dockerfile.backend ### nginx/nginx.conf ### deploy.sh ### README-DEPLOY.md";
-    var dr = "";
-    try { dr = await callClaude(DOCKER_SYS, "Project: " + ctx, function (t) { setSText(t); }, 3000); } catch (e) { dr = ""; }
-    setSText("");
-    var dnames = ["docker-compose.yml", "Dockerfile.frontend", "Dockerfile.backend", "nginx/nginx.conf", "deploy.sh", "README-DEPLOY.md"];
-    var dicons = { "docker-compose.yml": "◈", "Dockerfile.frontend": "⚛", "Dockerfile.backend": "⚙", "nginx/nginx.conf": "⬡", "deploy.sh": "▶", "README-DEPLOY.md": "≡" };
-    setDockFiles(dnames.map(function (dn) {
-      var re = new RegExp("###\\s+" + dn.replace(/\./g, "\\.").replace(/\//g, "\\/").replace(/-/g, "\\-") + "\\s*\\n```[\\w]*\\n([\\s\\S]*?)```", "i");
-      var dm = dr.match(re);
-      return { path: dn, code: dm ? dm[1].trim() : "# Generated: " + dn, dIcon: dicons[dn] || "◻" };
-    }));
-    addMsg("Docker deployment package ready.", "◍ Docker", "docker");
-
-    setPhase("demo"); setSLabel("Building interactive live demo...");
-    var bizCol = biz ? biz.color : "#818cf8";
-    var bizLabel = biz ? biz.label : "Business";
-    var DEMO_SYS = "You are an expert frontend developer. Write a single self-contained HTML file with embedded CSS and JS. Use Chart.js from CDN. Output ONLY a fenced ```html code block. Write every function fully — zero placeholders.";
-    var DEMO_PROMPT = "Build a COMPLETE single-file HTML POS/ERP demo for: " + bizLabel + "\n\nSpec:\n" + spec.slice(0, 1000) + "\n\n=== MUST WORK ===\n\nDATA: var products=[/* 15 domain items: id,name,cat,price,stock,e(emoji) */]; var orders=[/* 10 orders: id,num,cust,items,total,status,date */]; var customers=[/* 8: id,name,phone,email,spent */]; var cats=[]; var cart=[];\n\nLAYOUT: Fixed sidebar 240px background:#0f0a1e. Main area flex-1 overflow-auto. Nav: Dashboard,POS,Inventory,Orders,Customers,Reports. Nav click: hide all .sec, show target, update active.\n\nDASHBOARD: 4 stat cards + Chart.js bar (id=c1) + Chart.js doughnut (id=c2) + recent orders table. Charts init in window.onload.\n\nPOS: Left product grid (click=addToCart) + category filters. Right cart: items with qty +/-, totals, Complete Sale btn (creates order, deducts stock, clears cart, toast).\n\nINVENTORY: Search+filter table. Add/Edit modal form. Delete confirm.\n\nORDERS: Status filters. Table with View modal.\n\nCUSTOMERS: Search. CRUD with modal.\n\nREPORTS: Date filter + Chart.js line (id=c3) + top products table.\n\nMODAL: id=modal openModal(title,body,footer) closeModal()\n\nTOAST: fixed bottom-right showToast(msg,type) 3s auto-dismiss\n\nAI AGENT: Fixed circle 56px bottom:24px right:24px background:" + bizCol + " white 🤖 z-index:9999. Slide panel 300px from right. var hist=[]; var ASYS='AI for " + bizLabel + " POS. Products/orders/customers available. Include ACTION:{\"t\":\"addProduct\",\"name\":\"x\",\"cat\":\"x\",\"price\":0,\"stock\":0} to add items.'; async function ask(m){hist.push({role:'user',content:m});showTyping();var r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:400,system:ASYS,messages:hist})});var d=await r.json();var t=d.content&&d.content[0]?d.content[0].text:'Error';hist.push({role:'assistant',content:t});hideTyping();addMsg2('ai',t);var am=t.match(/ACTION:(\\{[^}]+\\})/);if(am){try{var a=JSON.parse(am[1]);if(a.t==='addProduct'){a.id=products.length+1;products.push(a);renderInv();showToast('Added '+a.name,'success');}}catch(e){}}}\n\nSTYLE: Font system-ui. Sidebar #0f0a1e. Primary " + bizCol + ". Cards white border-radius:12px shadow. Tables striped. Buttons rounded hover transitions. Professional clean UI.\n\nONLY CDN: https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js\n\nWRITE EVERY FUNCTION. ZERO PLACEHOLDERS. WORKS ON FIRST LOAD.";
-    var pf = "";
-    try { pf = await callClaudeComplete(DEMO_SYS, DEMO_PROMPT, function (t) { setSText(t); }, 8000); } catch (e) { pf = ""; }
-    setSText("");
-    var htmlOut = extractHTML(pf);
-    if (!htmlOut && pf.indexOf("<!DOCTYPE") !== -1) { var di = pf.indexOf("<!DOCTYPE"); htmlOut = pf.slice(di); var ei = htmlOut.lastIndexOf("</html>"); if (ei !== -1) htmlOut = htmlOut.slice(0, ei + 7); }
-    if (htmlOut) { setDemoHTML(htmlOut); setSrcdoc(htmlOut); setAtab("demo"); addMsg("Live interactive demo ready! Full working app with AI agent.", "◎ Live Demo", "demo"); }
-    else { addMsg("Demo generation issue. Source files available in Files tab.", "⚠ Demo", "demo"); }
-    setPhase("done");
-  }
-
-  async function applyChange(req) {
-    setError(""); setPhase("coding"); setSLabel("Updating demo...");
-    var full = "";
-    try { full = await callClaudeComplete("Apply change to this HTML app. Return ONLY one html code block.", "App:\n```html\n" + demoHTML + "\n```\n\nChange: \"" + req + "\"", function (t) { setSText(t); }, 8000); }
-    catch (e) { setError("Update: " + e.message); setPhase("done"); setSText(""); return; }
-    setSText("");
-    var nh = extractHTML(full);
-    if (nh) { setDemoHTML(nh); setSrcdoc(""); setTimeout(function () { setSrcdoc(nh); }, 80); setAtab("demo"); }
-    else addMsg("Could not apply change. Try rephrasing.", null, "done");
-    setPhase("done");
-  }
-
-  function send() {
-    var txt = inp.trim(); if (!txt && atts.length === 0) return; if (busy) return;
-    var content = txt || "Use attached files as UI reference.";
-    setInp(""); var myA = atts.slice(); setAtts([]);
-    setMsgs(function (p) { return p.concat([{ role: "user", content: content, atts: myA }]); });
-    if (phase === "done" && demoHTML) applyChange(content); else run(content);
-  }
-
-  function handleGenerate() {
-    var biz = null; for (var i = 0; i < BIZ.length; i++) { if (BIZ[i].id === selBiz) { biz = BIZ[i]; break; } }
-    var fd = desc.trim() || (biz ? biz.hint : ""); if (!fd) return;
-    if (!user) { setScreen("auth"); return; }
-    setScreen("builder"); setMsgs([]);
-    setMsgs(function (p) { return p.concat([{ role: "user", content: fd }]); });
-    run(fd);
-  }
-
-  function tabBtn(id, lbl, disabled) {
-    var active = atab === id;
-    return CE("button", { key: id, onClick: function () { if (!disabled) setAtab(id); }, style: { padding: "7px 16px", border: "none", background: active ? "rgba(139,92,246,0.15)" : "transparent", borderRadius: 8, cursor: disabled ? "not-allowed" : "pointer", fontSize: 12, fontWeight: active ? 700 : 500, color: disabled ? "rgba(255,255,255,0.15)" : active ? "#a78bfa" : "rgba(255,255,255,0.5)", transition: "all .2s", whiteSpace: "nowrap", backdropFilter: active ? "blur(10px)" : "none", boxShadow: active ? "inset 0 0 0 1px rgba(139,92,246,0.3)" : "none" } }, lbl);
-  }
-
-  var BASE = { minHeight: "100vh", background: "#050314", fontFamily: "'Inter',sans-serif", position: "relative", overflow: "hidden" };
-
-  // ── AUTH ────────────────────────────────────────────────────────────────────
-  if (!user && screen !== "intro") {
-    var isL = aScr === "login";
-    return CE("div", { style: BASE },
-      CE("style", null, GCSS),
-      CE(NeuralBG), CE(Particles),
-      CE("div", { style: { position: "relative", zIndex: 10, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 } },
-        CE("div", { style: { width: "100%", maxWidth: 420, animation: "fadeSlideUp .6s ease" } },
-          CE("div", { style: { textAlign: "center", marginBottom: 32 } },
-            CE("div", { style: { width: 60, height: 60, borderRadius: 18, background: "linear-gradient(135deg,#8b5cf6,#6366f1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, margin: "0 auto 14px", animation: "glow 3s ease-in-out infinite" } }, "⚡"),
-            CE("h1", { style: { fontSize: 28, fontWeight: 900, background: "linear-gradient(135deg,#fff,#a78bfa)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", letterSpacing: -1 } }, "Nexevel AI"),
-            CE("p", { style: { color: "rgba(255,255,255,0.4)", fontSize: 13, marginTop: 4, letterSpacing: 1, textTransform: "uppercase" } })
-          ),
-          CE("div", { style: { background: "rgba(255,255,255,0.03)", border: "1px solid rgba(139,92,246,0.2)", borderRadius: 20, padding: 28, backdropFilter: "blur(20px)" } },
-            CE("div", { style: { display: "flex", gap: 4, background: "rgba(0,0,0,0.3)", borderRadius: 10, padding: 4, marginBottom: 24 } },
-              CE("button", { onClick: function () { setAScr("login"); setAErr(""); }, style: { flex: 1, padding: "9px", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 700, background: aScr === "login" ? "linear-gradient(135deg,#8b5cf6,#6366f1)" : "transparent", color: aScr === "login" ? "#fff" : "rgba(255,255,255,0.4)", transition: "all .2s" } }, "Sign In"),
-              CE("button", { onClick: function () { setAScr("signup"); setAErr(""); }, style: { flex: 1, padding: "9px", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 700, background: aScr === "signup" ? "linear-gradient(135deg,#8b5cf6,#6366f1)" : "transparent", color: aScr === "signup" ? "#fff" : "rgba(255,255,255,0.4)", transition: "all .2s" } }, "Create Account")
-            ),
-            aErr && CE("div", { style: { background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 8, padding: "8px 12px", fontSize: 12, color: "#fca5a5", marginBottom: 16 } }, aErr),
-            isL ? CE("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
-              CE(GlowInput, null, CE("input", { type: "email", placeholder: "Email address", value: lf.email, onChange: function (e) { setLf(Object.assign({}, lf, { email: e.target.value })); }, style: iStyle, onKeyDown: function (e) { if (e.key === "Enter") doLogin(); } })),
-              CE(GlowInput, null, CE("input", { type: "password", placeholder: "Password", value: lf.password, onChange: function (e) { setLf(Object.assign({}, lf, { password: e.target.value })); }, style: iStyle, onKeyDown: function (e) { if (e.key === "Enter") doLogin(); } })),
-              CE("button", { onClick: doLogin, disabled: aLoad, style: { background: "linear-gradient(135deg,#8b5cf6,#6366f1)", color: "#fff", border: "none", borderRadius: 12, padding: "13px", fontSize: 14, fontWeight: 800, cursor: "pointer", marginTop: 4, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, boxShadow: "0 4px 20px rgba(139,92,246,0.4)" } }, aLoad ? CE("div", { style: { width: 16, height: 16, border: "2px solid rgba(255,255,255,0.4)", borderTop: "2px solid #fff", borderRadius: "50%", animation: "spin .8s linear infinite" } }) : "Sign In →"),
-              CE("div", { style: { textAlign: "center", fontSize: 12, color: "rgba(255,255,255,0.35)", marginTop: 4 } }, "No account? ", CE("span", { onClick: function () { setAScr("signup"); setAErr(""); }, style: { color: "#a78bfa", cursor: "pointer", fontWeight: 600 } }, "Sign up free"))
-            ) : CE("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
-              CE(GlowInput, null, CE("input", { type: "text", placeholder: "Full name", value: sf.name, onChange: function (e) { setSf(Object.assign({}, sf, { name: e.target.value })); }, style: iStyle })),
-              CE(GlowInput, null, CE("input", { type: "email", placeholder: "Email address", value: sf.email, onChange: function (e) { setSf(Object.assign({}, sf, { email: e.target.value })); }, style: iStyle })),
-              CE(GlowInput, null, CE("input", { type: "password", placeholder: "Password (min 6 chars)", value: sf.password, onChange: function (e) { setSf(Object.assign({}, sf, { password: e.target.value })); }, style: iStyle })),
-              CE(GlowInput, null, CE("input", { type: "password", placeholder: "Confirm password", value: sf.confirm, onChange: function (e) { setSf(Object.assign({}, sf, { confirm: e.target.value })); }, style: iStyle, onKeyDown: function (e) { if (e.key === "Enter") doSignup(); } })),
-              CE("button", { onClick: doSignup, disabled: aLoad, style: { background: "linear-gradient(135deg,#8b5cf6,#6366f1)", color: "#fff", border: "none", borderRadius: 12, padding: "13px", fontSize: 14, fontWeight: 800, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, boxShadow: "0 4px 20px rgba(139,92,246,0.4)" } }, aLoad ? CE("div", { style: { width: 16, height: 16, border: "2px solid rgba(255,255,255,0.4)", borderTop: "2px solid #fff", borderRadius: "50%", animation: "spin .8s linear infinite" } }) : "Create Account →"),
-              CE("div", { style: { textAlign: "center", fontSize: 12, color: "rgba(255,255,255,0.35)" } }, "Have account? ", CE("span", { onClick: function () { setAScr("login"); setAErr(""); }, style: { color: "#a78bfa", cursor: "pointer", fontWeight: 600 } }, "Sign in"))
-            )
-          )
-        )
-      )
-    );
-  }
-
-  // ── INTRO ───────────────────────────────────────────────────────────────────
-  if (screen === "intro") return CE("div", { style: BASE },
-    CE("style", null, GCSS),
-    CE(NeuralBG), CE(Particles),
-    CE("div", { style: { position: "relative", zIndex: 10, minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "40px 20px", textAlign: "center" } },
-      CE("div", { style: { animation: "float 4s ease-in-out infinite", marginBottom: 32 } },
-        CE("div", { style: { width: 90, height: 90, borderRadius: 26, background: "linear-gradient(135deg,#8b5cf6,#6366f1,#38bdf8)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 42, margin: "0 auto", animation: "glow 3s ease-in-out infinite", boxShadow: "0 0 40px rgba(139,92,246,0.5)" } }, "⚡")
+// ─── Step card for build report ────────────────────────────────────────────────
+function StepCard(props) {
+  var step = props.step;
+  var onEdit = props.onEdit;
+  var st = useState(false); var open=st[0],setOpen=st[1];
+  var statusColor = step.status==="done"?"#10b981":step.status==="running"?"#a78bfa":step.status==="error"?"#ef4444":"rgba(255,255,255,0.3)";
+  var statusBg = step.status==="done"?"rgba(16,185,129,0.1)":step.status==="running"?"rgba(139,92,246,0.1)":step.status==="error"?"rgba(239,68,68,0.1)":"rgba(255,255,255,0.03)";
+  return h("div",{style:{background:statusBg,border:"1px solid "+(step.status==="done"?"rgba(16,185,129,0.2)":step.status==="running"?"rgba(139,92,246,0.3)":"rgba(255,255,255,0.06)"),borderRadius:12,overflow:"hidden",marginBottom:8}},
+    h("div",{style:{padding:"12px 14px",display:"flex",alignItems:"center",gap:10,cursor:"pointer"},onClick:function(){setOpen(!open);}},
+      h("div",{style:{width:28,height:28,borderRadius:"50%",background:statusBg,border:"1px solid "+statusColor,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}},
+        step.status==="running"?h(Spinner,{size:11,color:"#a78bfa"}):h("span",{style:{fontSize:10,color:statusColor}},step.status==="done"?"✓":step.status==="error"?"✕":"○")
       ),
-      CE("div", { style: { animation: "fadeSlideUp .8s ease" } },
-        CE("div", { style: { fontSize: 11, fontWeight: 700, color: "#818cf8", letterSpacing: 4, textTransform: "uppercase", marginBottom: 12 } },
-          "Next Generation AI"
-        ),
-        CE("h1", { style: { fontSize: 62, fontWeight: 900, background: "linear-gradient(135deg,#ffffff 0%,#c4b5fd 40%,#818cf8 70%,#38bdf8 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", letterSpacing: -3, lineHeight: 1.05, marginBottom: 8 } }, "Nexevel AI"),
-        CE("div", { style: { fontSize: 20, fontWeight: 300, color: "rgba(255,255,255,0.5)", letterSpacing: 6, textTransform: "uppercase", marginBottom: 20 } }, "SaaS Builder"),
-        CE("p", { style: { fontSize: 16, color: "rgba(255,255,255,0.45)", maxWidth: 560, margin: "0 auto 48px", lineHeight: 1.8, fontWeight: 300 } }, "Describe your business. AI architects, codes every file, containerizes, and delivers a live interactive demo — in minutes."),
-        CE("div", { style: { display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap", marginBottom: 48 } },
-          ["✍ Refines Prompt", "◈ Plans Architecture", "⚛ React + TypeScript", "◉ Node + PostgreSQL", "◍ Docker Deploy", "◎ Live Demo"].map(function (f) {
-            return CE("div", { key: f, style: { background: "rgba(139,92,246,0.08)", border: "1px solid rgba(139,92,246,0.25)", borderRadius: 100, padding: "6px 16px", fontSize: 12, fontWeight: 500, color: "rgba(255,255,255,0.6)", backdropFilter: "blur(10px)" } }, f);
-          })
-        ),
-        CE("div", { style: { display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" } },
-          CE("button", { onClick: function () { setScreen("onboard"); }, style: { background: "linear-gradient(135deg,#8b5cf6,#6366f1)", color: "#fff", border: "none", borderRadius: 100, padding: "16px 44px", fontSize: 15, fontWeight: 700, cursor: "pointer", boxShadow: "0 0 40px rgba(139,92,246,0.5), 0 4px 30px rgba(99,102,241,0.4)", letterSpacing: .5, transition: "all .2s" } }, "Get Started →"),
-          !user ? CE("button", { onClick: function () { setScreen("auth"); }, style: { background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.6)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 100, padding: "16px 44px", fontSize: 15, fontWeight: 500, cursor: "pointer", backdropFilter: "blur(10px)" } }, "Sign In") : CE("button", { onClick: function () { setScreen("onboard"); }, style: { background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.6)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 100, padding: "16px 44px", fontSize: 15, fontWeight: 500, cursor: "pointer", backdropFilter: "blur(10px)" } }, "Continue →")
-        ),
-        CE("div", { style: { marginTop: 20, fontSize: 12, color: "rgba(255,255,255,0.2)", letterSpacing: 1 } })
+      h("div",{style:{flex:1}},
+        h("div",{style:{fontSize:12,fontWeight:700,color:step.status==="done"?"#10b981":step.status==="running"?"#a78bfa":"rgba(255,255,255,0.7)"}},step.label),
+        step.subtitle&&h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",marginTop:2}},step.subtitle)
+      ),
+      step.status==="done"&&onEdit&&h("button",{onClick:function(e){e.stopPropagation();onEdit();},style:{background:"rgba(139,92,246,0.15)",color:"#a78bfa",border:"1px solid rgba(139,92,246,0.3)",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:10,fontWeight:700,flexShrink:0}},"✏ Edit"),
+      h("span",{style:{fontSize:10,color:"rgba(255,255,255,0.3)",flexShrink:0}},open?"▲":"▼")
+    ),
+    open&&step.data&&h("div",{style:{borderTop:"1px solid rgba(255,255,255,0.06)",padding:"12px 14px",maxHeight:280,overflowY:"auto"}},
+      h("pre",{style:{fontSize:10,color:"rgba(200,200,255,0.8)",fontFamily:"monospace",whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.5}},
+        typeof step.data==="string"?step.data:JSON.stringify(step.data,null,2)
+      ),
+      h("div",{style:{marginTop:8,display:"flex",gap:6}},
+        h(CopyBtn,{text:typeof step.data==="string"?step.data:JSON.stringify(step.data,null,2),label:"Copy"})
       )
     )
   );
+}
 
-  // ── ONBOARD ─────────────────────────────────────────────────────────────────
-  if (screen === "onboard") {
-    var selBO = null; for (var oi = 0; oi < BIZ.length; oi++) { if (BIZ[oi].id === selBiz) { selBO = BIZ[oi]; break; } }
-    return CE("div", { style: BASE },
-      CE("style", null, GCSS),
-      CE(NeuralBG), CE(Particles),
-      CE("div", { style: { position: "relative", zIndex: 10, minHeight: "100vh", display: "flex", flexDirection: "column" } },
-        // topbar
-        CE("div", { style: { padding: "14px 28px", display: "flex", alignItems: "center", gap: 12, borderBottom: "1px solid rgba(255,255,255,0.05)", backdropFilter: "blur(20px)", background: "rgba(5,3,20,0.6)" } },
-          CE("div", { style: { width: 34, height: 34, borderRadius: 10, background: "linear-gradient(135deg,#8b5cf6,#6366f1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, boxShadow: "0 0 16px rgba(139,92,246,0.5)" } }, "⚡"),
-          CE("span", { style: { color: "#fff", fontWeight: 800, fontSize: 16, letterSpacing: -.3 } }, "Nexevel ", CE("span", { style: { color: "#a78bfa" } }, "AI")),
-          CE("div", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 } },
-            user ? CE("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-              CE("span", { style: { color: "rgba(255,255,255,0.4)", fontSize: 12 } }, "Hi, " + user.name.split(" ")[0]),
-              CE("button", { onClick: doLogout, style: { background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 20, padding: "5px 12px", cursor: "pointer", fontSize: 11, backdropFilter: "blur(10px)" } }, "Sign out")
-            ) : CE("button", { onClick: function () { setScreen("auth"); }, style: { background: "linear-gradient(135deg,#8b5cf6,#6366f1)", color: "#fff", border: "none", borderRadius: 20, padding: "7px 16px", cursor: "pointer", fontSize: 12, fontWeight: 700, boxShadow: "0 0 20px rgba(139,92,246,0.3)" } }, "Sign In")
-          )
+// ─── Edit modal ──────────────────────────────────────────────────────────────
+function EditModal(props) {
+  var st = useState(props.value||""); var val=st[0],setVal=st[1];
+  var saving = useState(false); var isSaving=saving[0],setIsSaving=saving[1];
+
+  async function handleSave() {
+    setIsSaving(true);
+    try { await props.onSave(val); } catch(e){}
+    setIsSaving(false);
+    props.onClose();
+  }
+
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#12102a",border:"1px solid rgba(139,92,246,0.3)",borderRadius:18,padding:24,width:"100%",maxWidth:680,maxHeight:"80vh",overflowY:"auto",display:"flex",flexDirection:"column",gap:14}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
+        h("div",null,
+          h("div",{style:{color:"#fff",fontWeight:800,fontSize:15}},props.title),
+          h("div",{style:{color:"rgba(255,255,255,0.4)",fontSize:11,marginTop:3}},props.hint||"Edit and save to regenerate downstream steps")
         ),
-        // content
-        CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 20px", overflowY: "auto" } },
-          CE("div", { style: { maxWidth: 740, width: "100%", animation: "fadeSlideUp .5s ease" } },
-            CE("div", { style: { textAlign: "center", marginBottom: 36 } },
-              CE("div", { style: { fontSize: 11, fontWeight: 700, color: "#818cf8", letterSpacing: 3, textTransform: "uppercase", marginBottom: 10 } }, "Step 1 of 2"),
-              CE("h2", { style: { fontSize: 30, fontWeight: 800, color: "#fff", letterSpacing: -1, marginBottom: 8 } }, "What's your business?"),
-              CE("p", { style: { color: "rgba(255,255,255,0.35)", fontSize: 14 } })
-            ),
-            CE("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12, marginBottom: 32 } },
-              BIZ.map(function (b) {
-                var isSel = selBiz === b.id;
-                return CE("div", { key: b.id, onClick: function () { setSelBiz(b.id); setDesc(""); }, style: { background: isSel ? "rgba(139,92,246,0.12)" : "rgba(255,255,255,0.03)", border: "1px solid " + (isSel ? b.color + "66" : "rgba(255,255,255,0.06)"), borderRadius: 16, padding: "20px 16px", cursor: "pointer", transition: "all .25s", textAlign: "center", position: "relative", backdropFilter: "blur(10px)", boxShadow: isSel ? "0 0 24px " + b.color + "33, inset 0 0 24px " + b.color + "11" : "none" } },
-                  isSel && CE("div", { style: { position: "absolute", top: 10, right: 10, width: 18, height: 18, borderRadius: "50%", background: b.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#fff", fontWeight: 800, boxShadow: "0 0 10px " + b.color } }, "✓"),
-                  CE("div", { style: { fontSize: 36, marginBottom: 10 } }, b.e),
-                  CE("div", { style: { fontWeight: 700, color: "#fff", fontSize: 13, marginBottom: 3 } }, b.label),
-                  CE("div", { style: { fontSize: 11, color: "rgba(255,255,255,0.35)", lineHeight: 1.4 } }, b.e)
-                );
-              })
-            ),
-            selBiz && CE("div", { style: { animation: "fadeSlideUp .4s ease", marginBottom: 24 } },
-              CE("div", { style: { fontSize: 11, fontWeight: 700, color: "#818cf8", letterSpacing: 2, textTransform: "uppercase", marginBottom: 12 } }, "Step 2 — Describe your software"),
-              CE(GlowInput, null,
-                CE("div", null,
-                  CE("div", { style: { padding: "12px 16px 0", display: "flex", alignItems: "center", gap: 8 } },
-                    CE("span", { style: { fontSize: 18 } }, selBO ? selBO.e : ""),
-                    CE("span", { style: { fontSize: 12, fontWeight: 600, color: "#a78bfa" } }, "Building " + (selBO ? selBO.label : "") + " software")
-                  ),
-                  CE("textarea", { value: desc, onChange: function (e) { setDesc(e.target.value); }, rows: 5, placeholder: selBO ? selBO.hint + "...\n\nBe specific: modules, features, integrations, reporting needs, user roles..." : "Describe requirements...", style: { width: "100%", background: "transparent", border: "none", padding: "10px 16px 14px", fontSize: 13.5, color: "#e2e8f0", fontFamily: "'Inter',sans-serif", lineHeight: 1.6, resize: "none", outline: "none", boxSizing: "border-box" } })
-                )
-              ),
-              CE("div", { style: { fontSize: 11, color: "rgba(255,255,255,0.25)", marginTop: 8, display: "flex", alignItems: "center", gap: 6 } },
-                CE("span", { style: { color: "#818cf8" } }, "⚡"),
-                "Your prompt will be refined by AI before building. More detail = better output."
-              )
-            ),
-            CE("button", { onClick: handleGenerate, disabled: !selBiz || !desc.trim(), style: { width: "100%", background: (!selBiz || !desc.trim()) ? "rgba(255,255,255,0.04)" : "linear-gradient(135deg,#8b5cf6,#6366f1)", color: (!selBiz || !desc.trim()) ? "rgba(255,255,255,0.2)" : "#fff", border: "1px solid " + (!selBiz || !desc.trim() ? "rgba(255,255,255,0.06)" : "transparent"), borderRadius: 14, padding: "16px", fontSize: 14, fontWeight: 800, cursor: (!selBiz || !desc.trim()) ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, backdropFilter: "blur(10px)", boxShadow: (!selBiz || !desc.trim()) ? "none" : "0 0 40px rgba(139,92,246,0.4), 0 4px 20px rgba(99,102,241,0.3)", transition: "all .3s" } },
-              CE("span", { style: { fontSize: 18 } }, "⚡"),
-              !user ? "Sign in to Generate" : "Generate My Software with AI"
+        h("button",{onClick:props.onClose,style:{background:"rgba(255,255,255,0.05)",color:"rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"4px 10px",cursor:"pointer",fontSize:12}},"✕")
+      ),
+      h("textarea",{value:val,onChange:function(e){setVal(e.target.value);},rows:12,style:{flex:1,background:"rgba(0,0,0,0.3)",border:"1px solid rgba(139,92,246,0.3)",borderRadius:10,padding:"12px",fontSize:12,color:"#e2e8f0",fontFamily:"monospace",resize:"none",lineHeight:1.6}}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+        h("button",{onClick:props.onClose,style:{background:"rgba(255,255,255,0.05)",color:"rgba(255,255,255,0.5)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:12}},"Cancel"),
+        h("button",{onClick:handleSave,disabled:isSaving,style:{background:"linear-gradient(135deg,#8b5cf6,#6366f1)",color:"#fff",border:"none",borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:6}},
+          isSaving?h(Spinner,{size:12,color:"#fff"}):"⚡",isSaving?"Regenerating...":"Save & Rebuild"
+        )
+      )
+    )
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  var u = useState(null); var user=u[0],setUser=u[1];
+  var am = useState("login"); var authMode=am[0],setAuthMode=am[1];
+  var ae = useState(""); var authError=ae[0],setAuthError=ae[1];
+  var al = useState(false); var authLoading=al[0],setAuthLoading=al[1];
+  var le = useState(""); var loginEmail=le[0],setLoginEmail=le[1];
+  var lp = useState(""); var loginPassword=lp[0],setLoginPassword=lp[1];
+  var sn = useState(""); var signupName=sn[0],setSignupName=sn[1];
+  var se = useState(""); var signupEmail=se[0],setSignupEmail=se[1];
+  var sp = useState(""); var signupPassword=sp[0],setSignupPassword=sp[1];
+
+  var sc = useState("intro"); var screen=sc[0],setScreen=sc[1];
+
+  // project list & current
+  var pl = useState([]); var projects=pl[0],setProjects=pl[1];
+  var cp = useState(null); var currentProject=cp[0],setCurrentProject=cp[1];
+
+  // prompt input
+  var ri = useState(""); var rawInput=ri[0],setRawInput=ri[1];
+  var biz = useState(null); var selectedBiz=biz[0],setSelectedBiz=biz[1];
+
+  // build state
+  var bst = useState([]); var buildSteps=bst[0],setBuildSteps=bst[1];
+  var lg = useState([]); var buildLog=lg[0],setBuildLog=lg[1];
+  var er = useState(""); var error=er[0],setError=er[1];
+  var bld = useState(false); var building=bld[0],setBuilding=bld[1];
+  var dh = useState(""); var demoHTML=dh[0],setDemoHTML=dh[1];
+  var at = useState("build"); var activeTab=at[0],setActiveTab=at[1];
+  var afile = useState(null); var activeFileIdx=afile[0],setActiveFileIdx=afile[1];
+  var em = useState(null); var editModal=em[0],setEditModal=em[1];
+
+  var BUSINESSES = [
+    {id:"retail",emoji:"🛍️",label:"Retail Shop",hint:"Retail POS with inventory and customers"},
+    {id:"restaurant",emoji:"🍽️",label:"Restaurant",hint:"Restaurant POS with menu and orders"},
+    {id:"agency",emoji:"🏢",label:"Agency CRM with clients and projects"},
+    {id:"school",emoji:"🎓",label:"School ERP with students and grades"},
+    {id:"fleet",emoji:"🚛",label:"Fleet management with vehicles and trips"},
+    {id:"pharmacy",emoji:"💊",label:"Pharmacy with medicines and prescriptions"},
+    {id:"gym",emoji:"💪",label:"Gym management with members and classes"},
+    {id:"hotel",emoji:"🏨",label:"Hotel management with rooms and bookings"}
+  ];
+
+  // ── auth ────────────────────────────────────────────────────────────────────
+  function handleLogin() {
+    setAuthError("");
+    if (!loginEmail||!loginPassword){setAuthError("Email and password required");return;}
+    setAuthLoading(true);
+    setTimeout(function(){
+      var found=_users.find(function(u){return u.email===loginEmail&&u.password===loginPassword;});
+      if(!found){setAuthError("Invalid credentials");setAuthLoading(false);return;}
+      setUser(found);setProjects(getProjects(found.id));setAuthLoading(false);setScreen("home");
+    },400);
+  }
+  function handleSignup() {
+    setAuthError("");
+    if(!signupName.trim()){setAuthError("Name required");return;}
+    if(signupEmail.indexOf("@")<0){setAuthError("Valid email required");return;}
+    if(signupPassword.length<6){setAuthError("Password must be 6+ chars");return;}
+    setAuthLoading(true);
+    setTimeout(function(){
+      if(_users.find(function(u){return u.email===signupEmail;})){setAuthError("Email already exists");setAuthLoading(false);return;}
+      var nu={id:"u_"+Date.now(),name:signupName.trim(),email:signupEmail,password:signupPassword};
+      _users.push(nu);setUser(nu);setProjects([]);setAuthLoading(false);setScreen("home");
+    },400);
+  }
+  function handleLogout(){setUser(null);setScreen("intro");setCurrentProject(null);setBuildSteps([]);setBuildLog([]);}
+
+  // ── build pipeline ──────────────────────────────────────────────────────────
+  function addLog(msg, type) {
+    setBuildLog(function(prev){return prev.concat([{msg:msg,type:type||"info",time:Date.now()}]);});
+  }
+
+  function updateStep(id, patch) {
+    setBuildSteps(function(prev){
+      return prev.map(function(s){return s.id===id?Object.assign({},s,patch):s;});
+    });
+  }
+
+  function initSteps() {
+    var steps = [
+      {id:"refine",label:"🧠 Prompt Refinement",subtitle:"AI analyzing and refining your idea",status:"pending",data:null},
+      {id:"spec",label:"📋 Technical Specification",subtitle:"Generating detailed spec",status:"pending",data:null},
+      {id:"plan",label:"🗂 File Plan",subtitle:"Architecting project structure",status:"pending",data:null},
+      {id:"code",label:"💻 Code Generation",subtitle:"Writing all project files",status:"pending",data:null},
+      {id:"demo",label:"🎨 Live Demo",subtitle:"Building interactive demo",status:"pending",data:null}
+    ];
+    setBuildSteps(steps);
+    return steps;
+  }
+
+  async function runBuild(proj, fromStep) {
+    setBuilding(true); setError("");
+    fromStep = fromStep || "refine";
+    var stepOrder = ["refine","spec","plan","code","demo"];
+    var startIdx = stepOrder.indexOf(fromStep);
+
+    // reset steps from startIdx onwards
+    setBuildSteps(function(prev){
+      return prev.map(function(s,i){
+        if(stepOrder.indexOf(s.id)>=startIdx) return Object.assign({},s,{status:"pending",data:null});
+        return s;
+      });
+    });
+
+    var p = Object.assign({},proj);
+
+    try {
+      // ── STEP 1: REFINE ──
+      if(startIdx<=0){
+        updateStep("refine",{status:"running",subtitle:"Analyzing your idea..."});
+        addLog("Starting prompt refinement for: "+p.rawPrompt.slice(0,60)+"...","info");
+        var bizLabel = "";
+        if(p.bizId){ var bz=BUSINESSES.find(function(b){return b.id===p.bizId;}); if(bz) bizLabel="Category: "+bz.label+"\n"; }
+        var refineRaw = await callClaude(REFINE_SYS, bizLabel+"Raw idea: "+p.rawPrompt, 1500);
+        var refineData = extractJSON(refineRaw, false);
+        if(!refineData) throw new Error("Could not parse refinement JSON");
+        p.refinedPrompt = refineData.refinedPrompt;
+        p.appName = refineData.appName;
+        p.refineReport = refineData;
+        updateStep("refine",{status:"done",subtitle:"Prompt refined ✓",data:refineData});
+        addLog("Prompt refined → "+refineData.appName,"success");
+        saveProject(p); setCurrentProject(p);
+      }
+
+      // ── STEP 2: SPEC ──
+      if(startIdx<=1){
+        updateStep("spec",{status:"running",subtitle:"Writing technical spec..."});
+        addLog("Generating technical specification...","info");
+        var specText = await callClaude(SPEC_SYS, "Refined prompt: "+p.refinedPrompt+"\nApp name: "+p.appName, 3000);
+        p.spec = specText;
+        updateStep("spec",{status:"done",subtitle:"Spec complete ✓",data:specText});
+        addLog("Specification complete ("+specText.length+" chars)","success");
+        saveProject(p); setCurrentProject(p);
+      }
+
+      // ── STEP 3: PLAN ──
+      if(startIdx<=2){
+        updateStep("plan",{status:"running",subtitle:"Architecting files..."});
+        addLog("Planning project file structure...","info");
+        var planRaw = await callClaude(PLAN_SYS, "App: "+p.appName+"\nSpec:\n"+p.spec, 2000);
+        var plannedFiles = extractJSON(planRaw, true);
+        if(!Array.isArray(plannedFiles)||plannedFiles.length===0){
+          plannedFiles = [
+            {path:"prisma/schema.prisma",type:"prisma",category:"Database",description:"Database schema"},
+            {path:"prisma/seed.js",type:"js",category:"Database",description:"Seed data"},
+            {path:"backend/server.js",type:"js",category:"Backend",description:"Express server"},
+            {path:"backend/routes/main.js",type:"js",category:"Backend",description:"Main API routes"},
+            {path:"src/App.tsx",type:"tsx",category:"Frontend",description:"Root component"},
+            {path:"src/pages/Dashboard.tsx",type:"tsx",category:"Frontend",description:"Dashboard page"},
+            {path:"src/pages/Main.tsx",type:"tsx",category:"Frontend",description:"Main entity page"},
+            {path:"package.json",type:"json",category:"Config",description:"Dependencies"},
+            {path:"README.md",type:"md",category:"Docs",description:"Documentation"}
+          ];
+        }
+        if(plannedFiles.length>14) plannedFiles=plannedFiles.slice(0,14);
+        p.plan = plannedFiles;
+        p.files = plannedFiles.map(function(f){return Object.assign({},f,{code:"",status:"pending"});});
+        updateStep("plan",{status:"done",subtitle:plannedFiles.length+" files planned ✓",data:plannedFiles});
+        addLog("File plan ready: "+plannedFiles.length+" files","success");
+        saveProject(p); setCurrentProject(p);
+      }
+
+      // ── STEP 4: CODE ──
+      if(startIdx<=3){
+        updateStep("code",{status:"running",subtitle:"Writing code files..."});
+        setActiveTab("files");
+        var files = (p.files||[]).map(function(f){return Object.assign({},f,{code:"",status:"pending"});});
+        p.files = files;
+
+        for(var fi=0;fi<files.length;fi++){
+          var file = files[fi];
+          addLog("Writing "+file.path+"...","info");
+          updateStep("code",{subtitle:"Writing "+(fi+1)+"/"+files.length+": "+file.path});
+          p.files[fi] = Object.assign({},file,{status:"writing"});
+          setCurrentProject(Object.assign({},p));
+
+          try {
+            var resp = await callClaude(
+              FILE_SYS(file.path, file.type, file.description, p.spec, p.refinedPrompt),
+              "Write the complete "+file.path+" file now.",
+              4000
+            );
+            var langMap={tsx:"tsx",ts:"typescript",js:"javascript",json:"json",sql:"sql",md:"markdown",prisma:"prisma",yaml:"yaml"};
+            var clean = extractCodeBlock(resp, langMap[file.type])||extractCodeBlock(resp,"")||resp;
+            p.files[fi] = Object.assign({},file,{code:clean,status:"done"});
+            addLog("✓ "+file.path+" ("+clean.length+" chars)","success");
+          } catch(err) {
+            p.files[fi] = Object.assign({},file,{code:"// Error: "+err.message,status:"error"});
+            addLog("✕ "+file.path+": "+err.message,"error");
+          }
+          setCurrentProject(Object.assign({},p));
+          saveProject(p);
+        }
+        var doneFiles = p.files.filter(function(f){return f.status==="done";}).length;
+        updateStep("code",{status:"done",subtitle:doneFiles+"/"+p.files.length+" files written ✓",data:p.files.map(function(f){return{path:f.path,status:f.status,chars:f.code.length};})});
+      }
+
+      // ── STEP 5: DEMO ──
+      if(startIdx<=4){
+        updateStep("demo",{status:"running",subtitle:"Building interactive demo..."});
+        addLog("Generating demo configuration...","info");
+        var demoCfgRaw = await callClaude(
+          DEMO_SYS,
+          "App: "+p.appName+"\nRefined: "+p.refinedPrompt+"\nSpec:\n"+(p.spec||"").slice(0,1500),
+          3000
+        );
+        var demoCfg = extractJSON(demoCfgRaw, false);
+        if(!demoCfg) demoCfg={appName:p.appName||"App",primary:{name:"Item",plural:"Items",emoji:"📦",fields:[{key:"name",label:"Name",type:"text"},{key:"price",label:"Price",type:"number"}]},secondary:{name:"Customer",plural:"Customers",emoji:"👥",fields:[{key:"name",label:"Name",type:"text"},{key:"email",label:"Email",type:"text"}]},transaction:{name:"Order",plural:"Orders",verb:"Create"},primaryColor:"#6366f1",primaryData:[],secondaryData:[],stats:[{label:"Revenue"},{label:"Total Items"},{label:"Total Customers"},{label:"Pending"}]};
+        p.demoConfig = demoCfg;
+        p.stage = "done";
+        var html = buildDemoHTML(demoCfg);
+        setDemoHTML(html);
+        updateStep("demo",{status:"done",subtitle:"Live demo ready ✓",data:demoCfg});
+        addLog("Demo built successfully","success");
+        saveProject(p); setCurrentProject(Object.assign({},p));
+        setProjects(getProjects(user.id));
+        setActiveTab("demo");
+      }
+
+    } catch(e) {
+      addLog("Build error: "+e.message,"error");
+      setError(e.message);
+    }
+    setBuilding(false);
+  }
+
+  async function startNewBuild() {
+    if(!rawInput.trim()) return;
+    var proj = {
+      id: newProjectId(),
+      userId: user.id,
+      name: "New Project",
+      createdAt: new Date().toISOString(),
+      rawPrompt: rawInput.trim(),
+      bizId: selectedBiz,
+      refinedPrompt:"",appName:"",refineReport:null,
+      spec:"",plan:[],files:[],demoConfig:null,stage:"building",log:[]
+    };
+    saveProject(proj);
+    setCurrentProject(proj);
+    setProjects(getProjects(user.id));
+    setBuildLog([]);
+    initSteps();
+    setDemoHTML("");
+    setActiveFileIdx(null);
+    setScreen("builder");
+    setActiveTab("build");
+    await runBuild(proj,"refine");
+  }
+
+  // ── edit step handler ────────────────────────────────────────────────────────────
+  function openEdit(stepId) {
+    var proj = currentProject;
+    if(!proj) return;
+    var config = {
+      refine: { title:"Edit Refined Prompt", hint:"Change the refined prompt — will regenerate Spec, Plan, Code & Demo", value:proj.refinedPrompt, fromStep:"spec" },
+      spec:   { title:"Edit Technical Spec", hint:"Modify the spec — will regenerate Plan, Code & Demo", value:proj.spec, fromStep:"plan" },
+      plan:   { title:"Edit File Plan", hint:"Modify JSON file plan — will regenerate Code & Demo", value:JSON.stringify(proj.plan,null,2), fromStep:"code" }
+    }[stepId];
+    if(!config) return;
+    setEditModal({stepId, ...config});
+  }
+
+  async function handleEditSave(stepId, newVal) {
+    var proj = Object.assign({},currentProject);
+    if(stepId==="refine") proj.refinedPrompt=newVal;
+    else if(stepId==="spec") proj.spec=newVal;
+    else if(stepId==="plan"){ try{proj.plan=JSON.parse(newVal);proj.files=proj.plan.map(function(f){return Object.assign({},f,{code:"",status:"pending"});});}catch(e){setError("Invalid JSON in plan");return;} }
+    saveProject(proj); setCurrentProject(proj);
+    setEditModal(null);
+    var fromStep = {refine:"spec",spec:"plan",plan:"code"}[stepId];
+    addLog("Re-running from step: "+fromStep,"warn");
+    await runBuild(proj, fromStep);
+  }
+
+  // ── load project ────────────────────────────────────────────────────────────
+  function loadProject(proj) {
+    setCurrentProject(proj);
+    setBuildLog([]);
+    var steps = [
+      {id:"refine",label:"🧠 Prompt Refinement",status:proj.refineReport?"done":"pending",data:proj.refineReport,subtitle:proj.refineReport?"Prompt refined ✓":"Pending"},
+      {id:"spec",label:"📋 Technical Specification",status:proj.spec?"done":"pending",data:proj.spec,subtitle:proj.spec?"Spec complete ✓":"Pending"},
+      {id:"plan",label:"🗂 File Plan",status:(proj.plan&&proj.plan.length)?"done":"pending",data:proj.plan,subtitle:(proj.plan&&proj.plan.length)?proj.plan.length+" files ✓":"Pending"},
+      {id:"code",label:"💻 Code Generation",status:(proj.files&&proj.files.some(function(f){return f.status==="done";}))?"done":"pending",data:proj.files?proj.files.map(function(f){return{path:f.path,status:f.status};}):null,subtitle:(proj.files&&proj.files.length)?proj.files.filter(function(f){return f.status==="done";}).length+"/"+proj.files.length+" files":"Pending"},
+      {id:"demo",label:"🎨 Live Demo",status:proj.demoConfig?"done":"pending",data:proj.demoConfig,subtitle:proj.demoConfig?"Demo ready ✓":"Pending"}
+    ];
+    setBuildSteps(steps);
+    if(proj.demoConfig) setDemoHTML(buildDemoHTML(proj.demoConfig));
+    else setDemoHTML("");
+    setActiveFileIdx(null);
+    setScreen("builder");
+    setActiveTab("build");
+  }
+
+  // ── input style ────────────────────────────────────────────────────────────
+  var iS = {width:"100%",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:10,padding:"11px 14px",fontSize:13.5,color:"#fff",fontFamily:"inherit"};
+
+  // ══ AUTH ════════════════════════════════════════════════════════════════════
+  if(!user) {
+    var isLogin = authMode==="login";
+    return h("div",{style:{minHeight:"100vh",background:"linear-gradient(135deg,#0a0817 0%,#1a1340 50%,#0a0817 100%)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("style",null,CSS),
+      h("div",{style:{width:"100%",maxWidth:420}},
+        h("div",{style:{textAlign:"center",marginBottom:32}},
+          h("div",{style:{width:64,height:64,borderRadius:20,background:"linear-gradient(135deg,#8b5cf6,#6366f1)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:32,margin:"0 auto 14px",animation:"glow 3s ease-in-out infinite"}},"⚡"),
+          h("h1",{style:{fontSize:30,fontWeight:900,background:"linear-gradient(135deg,#fff,#a78bfa)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",letterSpacing:-1}},"Nexevel AI"),
+          h("p",{style:{color:"rgba(255,255,255,0.4)",fontSize:12,marginTop:6}},"AI-powered SaaS builder with persistent build agent")
+        ),
+        h("div",{style:{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(139,92,246,0.2)",borderRadius:20,padding:28}},
+          h("div",{style:{display:"flex",gap:4,background:"rgba(0,0,0,0.3)",borderRadius:10,padding:4,marginBottom:20}},
+            h("button",{onClick:function(){setAuthMode("login");setAuthError("");},style:{flex:1,padding:9,border:"none",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:700,background:isLogin?"linear-gradient(135deg,#8b5cf6,#6366f1)":"transparent",color:isLogin?"#fff":"rgba(255,255,255,0.4)"}},"Sign In"),
+            h("button",{onClick:function(){setAuthMode("signup");setAuthError("");},style:{flex:1,padding:9,border:"none",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:700,background:!isLogin?"linear-gradient(135deg,#8b5cf6,#6366f1)":"transparent",color:!isLogin?"#fff":"rgba(255,255,255,0.4)"}},"Sign Up")
+          ),
+          authError&&h("div",{style:{background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.3)",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#fca5a5",marginBottom:14}},authError),
+          h("div",{style:{display:"flex",flexDirection:"column",gap:12}},
+            !isLogin&&h("input",{type:"text",placeholder:"Full name",value:signupName,onChange:function(e){setSignupName(e.target.value);},style:iS}),
+            h("input",{type:"email",placeholder:"Email",value:isLogin?loginEmail:signupEmail,onChange:function(e){isLogin?setLoginEmail(e.target.value):setSignupEmail(e.target.value);},onKeyDown:function(e){if(e.key==="Enter")isLogin?handleLogin():handleSignup();},style:iS}),
+            h("input",{type:"password",placeholder:isLogin?"Password":"Password (6+ chars)",value:isLogin?loginPassword:signupPassword,onChange:function(e){isLogin?setLoginPassword(e.target.value):setSignupPassword(e.target.value);},onKeyDown:function(e){if(e.key==="Enter")isLogin?handleLogin():handleSignup();},style:iS}),
+            h("button",{onClick:isLogin?handleLogin:handleSignup,disabled:authLoading,style:{background:"linear-gradient(135deg,#8b5cf6,#6366f1)",color:"#fff",border:"none",borderRadius:12,padding:13,fontSize:14,fontWeight:800,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:8}},
+              authLoading?h(Spinner,{color:"#fff"}):isLogin?"Sign In":"Create Account"
             )
           )
         )
@@ -465,259 +615,234 @@ export default function App() {
     );
   }
 
-  // ── BUILDER ─────────────────────────────────────────────────────────────────
-  return CE("div", { style: { display: "flex", flexDirection: "column", height: "100vh", background: "#050314", fontFamily: "'Inter',sans-serif", position: "relative", overflow: "hidden" } },
-    CE("style", null, GCSS),
-    CE(NeuralBG), CE(Particles),
-    CE("div", { style: { display: "flex", flexDirection: "column", height: "100%", position: "relative", zIndex: 10 } },
-
-      // Header
-      CE("div", { style: { background: "rgba(5,3,20,0.8)", borderBottom: "1px solid rgba(139,92,246,0.15)", padding: "8px 18px", display: "flex", alignItems: "center", gap: 12, flexShrink: 0, backdropFilter: "blur(20px)" } },
-        CE("div", { style: { width: 32, height: 32, borderRadius: 9, background: "linear-gradient(135deg,#8b5cf6,#6366f1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, boxShadow: "0 0 16px rgba(139,92,246,0.5)" } }, "⚡"),
-        CE("div", null,
-          CE("div", { style: { color: "#fff", fontWeight: 900, fontSize: 15, letterSpacing: -.3 } }, "Nexevel ", CE("span", { style: { color: "#a78bfa" } }, "AI")),
-          CE("div", { style: { color: "rgba(255,255,255,0.25)", fontSize: 8, fontWeight: 600, letterSpacing: 2, textTransform: "uppercase" } }, "SaaS Builder")
-        ),
-        // pipeline
-        CE("div", { style: { marginLeft: 16, display: "flex", gap: 4, alignItems: "center" } },
-          PHASES.filter(function (p) { return p.id !== "idle"; }).map(function (p, idx, arr) {
-            var order = PHASES.map(function (x) { return x.id; });
-            var done = order.indexOf(p.id) < order.indexOf(phase) || phase === "done";
-            var active = p.id === phase;
-            return CE("div", { key: p.id, style: { display: "flex", alignItems: "center", gap: 4 } },
-              CE("div", { title: p.label, style: { width: 22, height: 22, borderRadius: "50%", background: done ? "rgba(16,185,129,0.2)" : active ? "rgba(139,92,246,0.2)" : "rgba(255,255,255,0.05)", border: "1px solid " + (done ? "rgba(16,185,129,0.5)" : active ? p.color + "88" : "rgba(255,255,255,0.1)"), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: done ? "#10b981" : active ? p.color : "rgba(255,255,255,0.3)", transition: "all .4s", boxShadow: active ? "0 0 12px " + p.color + "66" : "none" } },
-                done ? "✓" : active ? CE("div", { style: { width: 10, height: 10, border: "1.5px solid " + p.color, borderTop: "1.5px solid transparent", borderRadius: "50%", animation: "spin .8s linear infinite" } }) : p.icon
-              ),
-              idx < arr.length - 1 && CE("div", { style: { width: 8, height: 1, background: done ? "rgba(16,185,129,0.4)" : "rgba(255,255,255,0.08)" } })
-            );
-          })
-        ),
-        busy && CE("span", { style: { fontSize: 10, color: "#a78bfa", fontWeight: 600, marginLeft: 4 } }),
-        CE("div", { style: { marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" } },
-          demoHTML && CE("button", { onClick: function () { setAtab(atab === "demo" ? "chat" : "demo"); }, style: { display: "flex", alignItems: "center", gap: 6, background: atab === "demo" ? "rgba(16,185,129,0.15)" : "rgba(16,185,129,0.1)", color: "#10b981", border: "1px solid rgba(16,185,129,0.3)", borderRadius: 20, padding: "6px 14px", cursor: "pointer", fontSize: 11, fontWeight: 700, backdropFilter: "blur(10px)", boxShadow: "0 0 16px rgba(16,185,129,0.2)", whiteSpace: "nowrap" } },
-            atab === "demo" ? "◎ Back to Build" : "◎ Open Live Demo", CE("span", { style: { background: "rgba(16,185,129,0.2)", borderRadius: 10, padding: "1px 6px", fontSize: 9, fontWeight: 800 } }, "LIVE")
-          ),
-          CE("button", { onClick: function () { setScreen("onboard"); }, style: { background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 20, padding: "5px 12px", cursor: "pointer", fontSize: 11, backdropFilter: "blur(10px)" } }, "+ New"),
-          user && CE("button", { onClick: doLogout, style: { background: "transparent", color: "rgba(255,255,255,0.25)", border: "none", padding: "5px", cursor: "pointer", fontSize: 11 } }, "Sign out")
+  // ══ HOME ════════════════════════════════════════════════════════════════════
+  if(screen==="intro"||screen==="home") {
+    var bizObj = BUSINESSES.find(function(b){return b.id===selectedBiz;});
+    return h("div",{style:{minHeight:"100vh",background:"#0a0817",display:"flex",flexDirection:"column"}},
+      h("style",null,CSS),
+      // nav
+      h("div",{style:{padding:"13px 24px",display:"flex",alignItems:"center",gap:12,borderBottom:"1px solid rgba(255,255,255,0.05)",background:"rgba(10,8,23,0.9)"}},
+        h("div",{style:{width:32,height:32,borderRadius:9,background:"linear-gradient(135deg,#8b5cf6,#6366f1)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}},"⚡"),
+        h("span",{style:{color:"#fff",fontWeight:800,fontSize:16}},"Nexevel ",h("span",{style:{color:"#a78bfa"}},"AI")),
+        h("div",{style:{marginLeft:"auto",display:"flex",gap:10,alignItems:"center"}},
+          h("span",{style:{color:"rgba(255,255,255,0.4)",fontSize:12}},"Hi, "+user.name.split(" ")[0]),
+          h("button",{onClick:handleLogout,style:{background:"rgba(255,255,255,0.05)",color:"rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:20,padding:"5px 12px",cursor:"pointer",fontSize:11}},"Sign out")
         )
       ),
-
-      // Tabs
-      CE("div", { style: { background: "rgba(5,3,20,0.6)", borderBottom: "1px solid rgba(255,255,255,0.05)", display: "flex", alignItems: "center", flexShrink: 0, paddingLeft: 8, gap: 2, backdropFilter: "blur(20px)" } },
-        tabBtn("chat", "◎ Build Log", false),
-        tabBtn("files", "⚛ Files" + (files.length ? " (" + files.filter(function (f) { return f.status === "done"; }).length + "/" + files.length + ")" : ""), files.length === 0),
-        tabBtn("docker", "◍ Docker" + (dockFiles.length ? " (" + dockFiles.length + ")" : ""), dockFiles.length === 0),
-        tabBtn("demo", "◎ Live Demo", !demoHTML),
-        CE("div", { style: { flex: 1 } })
-      ),
-
-      // Error
-      error && CE("div", { style: { background: "rgba(239,68,68,0.1)", borderBottom: "1px solid rgba(239,68,68,0.2)", padding: "6px 16px", fontSize: 12, color: "#fca5a5", display: "flex", justifyContent: "space-between", alignItems: "center" } },
-        error, CE("button", { onClick: function () { setError(""); }, style: { background: "none", border: "none", color: "#fca5a5", cursor: "pointer" } })
-      ),
-
-      CE("div", { style: { flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" } },
-
-        // CHAT / BUILD LOG
-        atab === "chat" && CE("div", { style: { flex: 1, overflowY: "auto", padding: "20px 16px", display: "flex", flexDirection: "column", gap: 14, maxWidth: 700, margin: "0 auto", width: "100%" } },
-          msgs.filter(function (m) { return m.role === "user"; }).slice(-1).map(function (msg, idx) {
-            return CE("div", { key: idx, style: { display: "flex", flexDirection: "row-reverse", gap: 8, alignItems: "flex-start", animation: "fadeSlideUp .3s ease" } },
-              CE("div", { style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg,#8b5cf6,#6366f1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, boxShadow: "0 0 12px rgba(139,92,246,0.4)" } }, "👤"),
-              CE("div", { style: { maxWidth: "80%", background: "linear-gradient(135deg,rgba(139,92,246,0.2),rgba(99,102,241,0.15))", border: "1px solid rgba(139,92,246,0.3)", color: "#e2e8f0", borderRadius: "18px 4px 18px 18px", padding: "10px 14px", backdropFilter: "blur(10px)" } },
-                CE("p", { style: { margin: 0, fontSize: 13.5 } }, msg.content)
-              )
-            );
-          }),
-          (busy || phase === "done") && CE("div", { style: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(139,92,246,0.2)", borderRadius: 20, overflow: "hidden", animation: "fadeSlideUp .4s ease", backdropFilter: "blur(20px)" } },
-            CE("div", { style: { background: "linear-gradient(135deg,rgba(139,92,246,0.2),rgba(99,102,241,0.1))", padding: "14px 18px", display: "flex", alignItems: "center", gap: 10, borderBottom: "1px solid rgba(139,92,246,0.15)" } },
-              CE("div", { style: { width: 32, height: 32, borderRadius: 9, background: "linear-gradient(135deg,#8b5cf6,#6366f1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, boxShadow: "0 0 16px rgba(139,92,246,0.5)" } }, "⚡"),
-              CE("div", null,
-                CE("div", { style: { color: "#fff", fontWeight: 800, fontSize: 13 } }, "Nexevel AI Agent"),
-                CE("div", { style: { color: "rgba(255,255,255,0.35)", fontSize: 11 } }, phase === "done" ? "Build complete" : "Building your software...")
-              ),
-              busy && CE("div", { style: { marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 } }, CE("div", { style: { width: 6, height: 6, borderRadius: "50%", background: "#a78bfa", animation: "pulse 1s infinite" } }), CE("span", { style: { fontSize: 10, color: "#a78bfa", fontWeight: 700, letterSpacing: 1 } }, "LIVE"))
-            ),
-            CE("div", { style: { padding: "16px 18px", display: "flex", flexDirection: "column", gap: 2 } },
-              PHASES.filter(function (p) { return p.id !== "idle"; }).map(function (p, idx, arr) {
-                var order = PHASES.map(function (x) { return x.id; });
-                var isDone = order.indexOf(p.id) < order.indexOf(phase) || phase === "done";
-                var isActive = p.id === phase;
-                var isLast = idx === arr.length - 1;
-                var subs = { refine: "Prompt → professional spec", plan: files.length > 0 ? files.length + " files planned" : "Planning files", coding: files.length > 0 ? files.filter(function (f) { return f.status === "done"; }).length + "/" + files.length + " files written" : "", docker: "6 deployment files", demo: "Interactive working demo" };
-                return CE("div", { key: p.id, style: { display: "flex", gap: 12, alignItems: "flex-start" } },
-                  CE("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 } },
-                    CE("div", { style: { width: 32, height: 32, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, transition: "all .4s", background: isDone ? "rgba(16,185,129,0.15)" : isActive ? "rgba(139,92,246,0.15)" : "rgba(255,255,255,0.04)", border: "1px solid " + (isDone ? "rgba(16,185,129,0.4)" : isActive ? p.color + "66" : "rgba(255,255,255,0.08)"), boxShadow: isActive ? "0 0 16px " + p.color + "44" : "none" } },
-                      isDone ? CE("span", { style: { color: "#10b981", fontSize: 12 } }, "✓") : isActive ? CE("div", { style: { width: 13, height: 13, border: "2px solid " + p.color, borderTop: "2px solid transparent", borderRadius: "50%", animation: "spin .8s linear infinite" } }) : CE("span", { style: { fontSize: 12, color: "rgba(255,255,255,0.2)" } }, p.icon)
-                    ),
-                    !isLast && CE("div", { style: { width: 1, height: 22, background: isDone ? "rgba(16,185,129,0.3)" : "rgba(255,255,255,0.06)", margin: "2px 0" } })
-                  ),
-                  CE("div", { style: { paddingTop: 6, paddingBottom: isLast ? 0 : 22 } },
-                    CE("div", { style: { fontSize: 12.5, fontWeight: isDone || isActive ? 700 : 400, color: isDone ? "#10b981" : isActive ? p.color : "rgba(255,255,255,0.3)", display: "flex", alignItems: "center", gap: 8 } },
-                      p.label,
-                      isActive && CE("span", { style: { fontSize: 9, background: p.color + "22", color: p.color, border: "1px solid " + p.color + "44", borderRadius: 10, padding: "1px 7px", fontWeight: 700, letterSpacing: .5 } }, "RUNNING"),
-                      isDone && CE("span", { style: { fontSize: 9, background: "rgba(16,185,129,0.12)", color: "#10b981", border: "1px solid rgba(16,185,129,0.3)", borderRadius: 10, padding: "1px 7px", fontWeight: 700 } })
-                    ),
-                    isActive && sLabel && CE("div", { style: { fontSize: 10.5, color: "rgba(255,255,255,0.3)", marginTop: 3, display: "flex", alignItems: "center", gap: 4 } }, CE("span", { style: { width: 4, height: 4, borderRadius: "50%", background: p.color, display: "inline-block", animation: "pulse .8s infinite" } }), sLabel),
-                    isDone && subs[p.id] && CE("div", { style: { fontSize: 10, color: "rgba(255,255,255,0.25)", marginTop: 2 } }, subs[p.id])
-                  )
-                );
-              })
-            ),
-            phase === "done" && CE("div", { style: { borderTop: "1px solid rgba(255,255,255,0.06)", padding: "14px 18px", display: "flex", flexDirection: "column", gap: 10 } },
-              CE("div", { style: { background: "rgba(16,185,129,0.08)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 12, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 } },
-                CE("span", { style: { fontSize: 16 } }, "🤖"),
-                CE("div", null,
-                  CE("div", { style: { fontSize: 12, fontWeight: 700, color: "#10b981" } }, "AI Agent embedded in your app"),
-                  CE("div", { style: { fontSize: 11, color: "rgba(255,255,255,0.3)" } })
-                )
-              ),
-              CE("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
-                demoHTML && CE("button", { onClick: function () { setAtab("demo"); }, style: { background: "linear-gradient(135deg,rgba(16,185,129,0.2),rgba(5,150,105,0.15))", color: "#10b981", border: "1px solid rgba(16,185,129,0.3)", borderRadius: 10, padding: "9px 16px", cursor: "pointer", fontSize: 12, fontWeight: 700, backdropFilter: "blur(10px)" } }, "◎ Open Live Demo"),
-                files.length > 0 && CE("button", { onClick: function () { setAtab("files"); }, style: { background: "rgba(139,92,246,0.1)", color: "#a78bfa", border: "1px solid rgba(139,92,246,0.25)", borderRadius: 10, padding: "9px 16px", cursor: "pointer", fontSize: 12, fontWeight: 700 } }, "⚛ View Code"),
-                dockFiles.length > 0 && CE("button", { onClick: function () { setAtab("docker"); }, style: { background: "rgba(56,189,248,0.08)", color: "#38bdf8", border: "1px solid rgba(56,189,248,0.2)", borderRadius: 10, padding: "9px 16px", cursor: "pointer", fontSize: 12, fontWeight: 700 } }, "◍ Docker Files")
-              )
-            )
+      h("div",{style:{flex:1,display:"flex",gap:0,overflow:"hidden"}},
+        // sidebar - project history
+        h("div",{style:{width:260,background:"rgba(255,255,255,0.02)",borderRight:"1px solid rgba(255,255,255,0.05)",display:"flex",flexDirection:"column",flexShrink:0}},
+          h("div",{style:{padding:"14px 16px",borderBottom:"1px solid rgba(255,255,255,0.05)"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:"rgba(255,255,255,0.3)",textTransform:"uppercase",letterSpacing:1.5}},"Your Projects"),
+            h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.2)",marginTop:3}},projects.length+" build"+(projects.length!==1?"s":"")+" saved")
           ),
-          CE("div", { ref: bottomRef })
-        ),
-
-        // FILES
-        atab === "files" && CE("div", { style: { flex: 1, display: "flex", overflow: "hidden" } },
-          CE("div", { style: { width: 240, background: "rgba(5,3,20,0.8)", borderRight: "1px solid rgba(139,92,246,0.1)", overflowY: "auto", flexShrink: 0, backdropFilter: "blur(20px)" } },
-            CE("div", { style: { padding: "10px 12px", fontSize: 9, fontWeight: 700, color: "rgba(255,255,255,0.25)", textTransform: "uppercase", letterSpacing: 1.5, borderBottom: "1px solid rgba(255,255,255,0.05)" } }, "⚛ Project Files"),
-            files.length === 0 && CE("div", { style: { padding: 16, fontSize: 11, color: "rgba(255,255,255,0.2)", textAlign: "center" } }, "Files appear as agent writes..."),
-            ["config", "frontend", "backend", "database"].map(function (cat) {
-              var cf = files.filter(function (f) { return (f.category || "frontend") === cat; });
-              if (!cf.length) return null;
-              var cl = { "config": "⚙ Config", "frontend": "⚛ Frontend", "backend": "⬡ Backend", "database": "◈ Database" }[cat] || cat;
-              return CE("div", { key: cat },
-                CE("div", { style: { padding: "5px 12px", fontSize: 8, fontWeight: 700, color: "rgba(255,255,255,0.2)", textTransform: "uppercase", letterSpacing: 1, background: "rgba(0,0,0,0.3)" } }),
-                cf.map(function (f) {
-                  var i = files.indexOf(f);
-                  return CE("div", { key: i, onClick: function () { setActiveFile(i); }, style: { padding: "7px 12px", cursor: "pointer", borderBottom: "1px solid rgba(255,255,255,0.03)", background: activeFile === i ? "rgba(139,92,246,0.1)" : "transparent", display: "flex", alignItems: "center", gap: 7, transition: "all .15s" } },
-                    CE("span", { style: { fontSize: 11, color: activeFile === i ? "#a78bfa" : "rgba(255,255,255,0.25)", fontFamily: "monospace" } }),
-                    CE("div", { style: { flex: 1, minWidth: 0 } },
-                      CE("div", { style: { fontSize: 10.5, color: activeFile === i ? "#e2e8f0" : "rgba(255,255,255,0.4)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, f.path.split("/").pop()),
-                      CE("div", { style: { fontSize: 8, color: sColor(f.status), marginTop: 1, letterSpacing: .5 } }),
-                      CE("div", { style: { fontSize: 8, color: "rgba(255,255,255,0.2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, f.path)
-                    )
-                  );
-                })
+          h("div",{style:{flex:1,overflowY:"auto"}},
+            projects.length===0&&h("div",{style:{padding:20,fontSize:11,color:"rgba(255,255,255,0.2)",textAlign:"center"}},"No projects yet.\nStart building below."),
+            projects.slice().reverse().map(function(proj,i){
+              return h("div",{key:proj.id,onClick:function(){loadProject(proj);},style:{padding:"12px 16px",cursor:"pointer",borderBottom:"1px solid rgba(255,255,255,0.03)",background:currentProject&&currentProject.id===proj.id?"rgba(139,92,246,0.1)":"transparent",transition:"background .15s"}},
+                h("div",{style:{fontSize:12,fontWeight:700,color:"#fff",marginBottom:3}},proj.appName||proj.name||"Unnamed"),
+                h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.35)",marginBottom:4}},proj.rawPrompt.slice(0,55)+"..."),
+                h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+                  h("span",{style:{fontSize:9,padding:"2px 7px",borderRadius:10,fontWeight:700,background:proj.stage==="done"?"rgba(16,185,129,0.15)":"rgba(139,92,246,0.15)",color:proj.stage==="done"?"#10b981":"#a78bfa"}},proj.stage==="done"?"✓ Done":"Building"),
+                  h("span",{style:{fontSize:9,color:"rgba(255,255,255,0.25)"}},new Date(proj.createdAt).toLocaleDateString())
+                )
               );
             })
-          ),
-          CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: "rgba(8,6,24,0.9)" } },
-            activeFile !== null && files[activeFile]
-              ? CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" } },
-                CE("div", { style: { background: "rgba(5,3,20,0.9)", padding: "7px 14px", display: "flex", alignItems: "center", gap: 9, flexShrink: 0, borderBottom: "1px solid rgba(139,92,246,0.1)" } },
-                  CE("span", { style: { fontSize: 12, color: "#a78bfa", fontFamily: "monospace" } }),
-                  CE("span", { style: { fontFamily: "monospace", fontSize: 12, color: "rgba(255,255,255,0.7)", fontWeight: 500 } }, files[activeFile].path),
-                  CE("span", { style: { fontSize: 9, background: "rgba(139,92,246,0.15)", color: "#a78bfa", border: "1px solid rgba(139,92,246,0.25)", borderRadius: 8, padding: "1px 7px", fontWeight: 700, letterSpacing: .5, marginLeft: 4 } }, files[activeFile].type.toUpperCase()),
-                  CE("div", { style: { marginLeft: "auto" } }, files[activeFile].code && CE(CopyBtn, { text: files[activeFile].code, small: true, label: "Copy" }))
-                ),
-                CE("div", { style: { flex: 1, overflowY: "auto", padding: 14 } },
-                  files[activeFile].status === "writing" && sText
-                    ? CE("pre", { style: { color: "rgba(200,200,255,0.7)", fontSize: 11.5, lineHeight: 1.7, fontFamily: "'JetBrains Mono','Fira Code',monospace", margin: 0, whiteSpace: "pre-wrap" } }, sText)
-                    : files[activeFile].code
-                      ? CE("pre", { style: { color: "rgba(200,200,255,0.7)", fontSize: 11.5, lineHeight: 1.7, fontFamily: "'JetBrains Mono','Fira Code',monospace", margin: 0, whiteSpace: "pre-wrap" } }, files[activeFile].code)
-                      : CE("div", { style: { color: "rgba(255,255,255,0.2)", fontSize: 12, paddingTop: 20, textAlign: "center" } }, "Waiting...")
-                )
-              )
-              : CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: "rgba(255,255,255,0.2)" } },
-                CE("div", { style: { fontSize: 40 } }, "⚛"), CE("div", { style: { fontSize: 13 } }, files.length === 0 ? "Files appear once agent starts..." : "Select a file to view code")
-              )
           )
         ),
-
-        // DOCKER
-        atab === "docker" && CE("div", { style: { flex: 1, display: "flex", overflow: "hidden" } },
-          CE("div", { style: { width: 210, background: "rgba(5,3,20,0.8)", borderRight: "1px solid rgba(56,189,248,0.1)", overflowY: "auto", flexShrink: 0 } },
-            CE("div", { style: { padding: "10px 12px", fontSize: 9, fontWeight: 700, color: "rgba(56,189,248,0.5)", textTransform: "uppercase", letterSpacing: 1.5, borderBottom: "1px solid rgba(56,189,248,0.08)", display: "flex", alignItems: "center", gap: 5 } }, "◍ Docker Files"),
-            dockFiles.map(function (f, i) {
-              return CE("div", { key: i, onClick: function () { setActiveFile(1000 + i); }, style: { padding: "8px 12px", cursor: "pointer", borderBottom: "1px solid rgba(255,255,255,0.03)", background: activeFile === (1000 + i) ? "rgba(56,189,248,0.08)" : "transparent", display: "flex", alignItems: "center", gap: 7 } },
-                CE("span", { style: { fontSize: 12, color: "#38bdf8" } }),
-                CE("div", { style: { flex: 1, minWidth: 0 } }, CE("div", { style: { fontSize: 11, color: activeFile === (1000 + i) ? "#7dd3fc" : "rgba(255,255,255,0.35)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, f.path))
-              );
-            }),
-            dockFiles.length > 0 && CE("div", { style: { padding: 12, marginTop: 8, borderTop: "1px solid rgba(56,189,248,0.08)" } },
-              CE("div", { style: { background: "rgba(56,189,248,0.08)", border: "1px solid rgba(56,189,248,0.2)", borderRadius: 10, padding: "10px 12px", textAlign: "center" } },
-                CE("div", { style: { fontSize: 10, fontWeight: 700, color: "#38bdf8", marginBottom: 6 } }, "Deploy Command"),
-                CE("div", { style: { fontFamily: "monospace", fontSize: 11, color: "#7dd3fc", background: "rgba(0,0,0,0.4)", padding: "6px 10px", borderRadius: 6 } })
-              )
-            )
-          ),
-          CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: "rgba(5,3,20,0.9)" } },
-            activeFile !== null && activeFile >= 1000 && dockFiles[activeFile - 1000]
-              ? CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" } },
-                CE("div", { style: { background: "rgba(5,3,20,0.9)", padding: "7px 14px", display: "flex", alignItems: "center", gap: 9, flexShrink: 0, borderBottom: "1px solid rgba(56,189,248,0.1)" } },
-                  CE("span", { style: { fontSize: 14 } }, "◍"),
-                  CE("span", { style: { fontFamily: "monospace", fontSize: 12, color: "#7dd3fc", fontWeight: 500 } }, dockFiles[activeFile - 1000].path),
-                  CE("div", { style: { marginLeft: "auto" } }, CE(CopyBtn, { text: dockFiles[activeFile - 1000].code, small: true, label: "Copy" }))
-                ),
-                CE("div", { style: { flex: 1, overflowY: "auto", padding: 14 } }, CE("pre", { style: { color: "rgba(180,220,240,0.7)", fontSize: 11.5, lineHeight: 1.7, fontFamily: "monospace", margin: 0, whiteSpace: "pre-wrap" } }, dockFiles[activeFile - 1000].code))
-              )
-              : CE("div", { style: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,0.15)", fontSize: 13 } }, "Select a file")
-          )
-        ),
-
-        // DEMO
-        atab === "demo" && CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" } },
-          CE("div", { style: { background: "rgba(5,3,20,0.9)", padding: "5px 12px", display: "flex", alignItems: "center", gap: 8, flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.05)", backdropFilter: "blur(20px)" } },
-            CE("div", { style: { display: "flex", gap: 4 } }, ["#ff5f57", "#febc2e", "#28c840"].map(function (c, i) { return CE("div", { key: i, style: { width: 11, height: 11, borderRadius: "50%", background: c } }); })),
-            CE("div", { style: { flex: 1, background: "rgba(255,255,255,0.05)", borderRadius: 8, padding: "4px 12px", fontSize: 11, color: "rgba(255,255,255,0.3)", fontFamily: "monospace", display: "flex", alignItems: "center", gap: 6 } },
-              demoHTML && CE("span", { style: { color: "#10b981", fontSize: 9 } }, "● LIVE"),
-              CE("span", { style: { marginLeft: 4 } }, "app.nexevel.ai/demo")
+        // main - new build
+        h("div",{style:{flex:1,overflowY:"auto",padding:"32px 32px"}},
+          h("div",{style:{maxWidth:680,margin:"0 auto"}},
+            h("div",{style:{marginBottom:28}},
+              h("h2",{style:{fontSize:24,fontWeight:800,color:"#fff",letterSpacing:-0.5,marginBottom:6}},"Build New Software"),
+              h("p",{style:{color:"rgba(255,255,255,0.4)",fontSize:13,lineHeight:1.6}},"Describe your idea. Our AI agent will refine your prompt, generate a spec, plan the architecture, write all code, and build a live demo — saving every step so you can edit and rebuild anytime.")
             ),
-            demoHTML && CE("button", { onClick: function () { setSrcdoc(""); setTimeout(function () { setSrcdoc(demoHTML); }, 80); }, style: { background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 6, padding: "3px 10px", cursor: "pointer", fontSize: 10 } }, "↺"),
-            demoHTML && CE(CopyBtn, { text: demoHTML, small: true, label: "Copy HTML" })
-          ),
-          demoHTML && CE("div", { style: { background: "linear-gradient(135deg,rgba(124,58,237,0.08),rgba(99,102,241,0.05))", borderBottom: "1px solid rgba(139,92,246,0.1)", padding: "5px 16px", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 } },
-            CE("span", { style: { fontSize: 13 } }, "🤖"),
-            CE("span", { style: { fontSize: 11, fontWeight: 700, color: "#8b5cf6" } }, "AI Agent live — "),
-            CE("span", { style: { fontSize: 11, color: "rgba(255,255,255,0.3)" } }, "Click purple button (bottom-right) to interact in plain English")
-          ),
-          demoHTML
-            ? CE("iframe", { key: "demo-" + demoHTML.length, srcdoc: srcdoc || demoHTML, style: { flex: 1, border: "none", background: "#fff", width: "100%" }, title: "Live Demo", sandbox: "allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-downloads" })
-            : CE("div", { style: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, color: "rgba(255,255,255,0.2)" } },
-              CE("div", { style: { fontSize: 56 } }, "◎"),
-              CE("div", { style: { fontSize: 16, fontWeight: 600, color: "rgba(255,255,255,0.4)" } }, "Live Demo"),
-              CE("div", { style: { fontSize: 13, maxWidth: 400, textAlign: "center", lineHeight: 1.7 } }, phase === "done" ? "Demo generation failed. Check the Files tab." : "After build completes, your interactive demo appears here.")
+            // biz picker
+            h("div",{style:{marginBottom:20}},
+              h("div",{style:{fontSize:11,fontWeight:700,color:"rgba(255,255,255,0.4)",marginBottom:10,textTransform:"uppercase",letterSpacing:1}},"Category (optional)"),
+              h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}},
+                BUSINESSES.map(function(b){
+                  var isSel=selectedBiz===b.id;
+                  return h("div",{key:b.id,onClick:function(){setSelectedBiz(isSel?null:b.id);},style:{background:isSel?"rgba(139,92,246,0.15)":"rgba(255,255,255,0.03)",border:"1px solid "+(isSel?"rgba(139,92,246,0.5)":"rgba(255,255,255,0.06)"),borderRadius:10,padding:"10px 8px",cursor:"pointer",textAlign:"center"}},
+                    h("div",{style:{fontSize:22,marginBottom:4}},b.emoji),
+                    h("div",{style:{fontSize:10,color:"#fff",fontWeight:600}},b.label)
+                  );
+                })
+              )
+            ),
+            // prompt input
+            h("div",{style:{marginBottom:16}},
+              h("div",{style:{fontSize:11,fontWeight:700,color:"rgba(255,255,255,0.4)",marginBottom:8,textTransform:"uppercase",letterSpacing:1}},"Describe Your App"),
+              h("textarea",{value:rawInput,onChange:function(e){setRawInput(e.target.value);},rows:5,placeholder:bizObj?bizObj.hint+"...\n\nBe specific: who are the users? what are the core features? any special requirements?":"Describe what you want to build...\n\nExample: A pharmacy management system that handles medicine inventory, customer prescriptions, billing, and supplier orders with low-stock alerts.",style:{width:"100%",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(139,92,246,0.3)",borderRadius:12,padding:"14px",fontSize:13,color:"#fff",fontFamily:"inherit",lineHeight:1.7,resize:"vertical",minHeight:120}})
+            ),
+            h("button",{onClick:startNewBuild,disabled:!rawInput.trim()||building,style:{width:"100%",background:!rawInput.trim()?"rgba(255,255,255,0.05)":"linear-gradient(135deg,#8b5cf6,#6366f1)",color:!rawInput.trim()?"rgba(255,255,255,0.2)":"#fff",border:"none",borderRadius:12,padding:"15px",fontSize:14,fontWeight:800,cursor:!rawInput.trim()?"not-allowed":"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:10,boxShadow:rawInput.trim()?"0 0 40px rgba(139,92,246,0.35)":"none"}},
+              h("span",{style:{fontSize:18}},"⚡"),"Generate My Software"
             )
+          )
+        )
+      )
+    );
+  }
+
+  // ══ BUILDER ═════════════════════════════════════════════════════════════════
+  var proj = currentProject;
+  var files = proj&&proj.files||[];
+  var doneFiles = files.filter(function(f){return f.status==="done";}).length;
+  var curFile = activeFileIdx!==null?files[activeFileIdx]:null;
+
+  return h("div",{style:{display:"flex",flexDirection:"column",height:"100vh",background:"#0a0817"}},
+    h("style",null,CSS),
+    editModal&&h(EditModal,{title:editModal.title,hint:editModal.hint,value:editModal.value,onClose:function(){setEditModal(null);},onSave:function(v){return handleEditSave(editModal.stepId,v);}}),
+
+    // ── top bar
+    h("div",{style:{background:"rgba(10,8,23,0.95)",borderBottom:"1px solid rgba(139,92,246,0.15)",padding:"9px 18px",display:"flex",alignItems:"center",gap:12,flexShrink:0}},
+      h("div",{style:{width:28,height:28,borderRadius:8,background:"linear-gradient(135deg,#8b5cf6,#6366f1)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}},"⚡"),
+      h("div",{style:{color:"#fff",fontWeight:900,fontSize:14}},"Nexevel ",h("span",{style:{color:"#a78bfa"}},"AI")),
+      proj&&h("div",{style:{display:"flex",alignItems:"center",gap:6,marginLeft:8}},
+        h("span",{style:{fontSize:10,color:"rgba(255,255,255,0.3)"}},"›"),
+        h("span",{style:{fontSize:12,color:"rgba(255,255,255,0.6)",fontWeight:600}},proj.appName||proj.rawPrompt.slice(0,30)+"...")
+      ),
+      building&&h("div",{style:{display:"flex",alignItems:"center",gap:6,marginLeft:8,background:"rgba(139,92,246,0.1)",border:"1px solid rgba(139,92,246,0.3)",borderRadius:20,padding:"3px 10px"}},
+        h(Spinner,{size:10,color:"#a78bfa"}),h("span",{style:{fontSize:10,color:"#a78bfa",fontWeight:600}},"Building...")
+      ),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:function(){setScreen("home");},style:{background:"rgba(255,255,255,0.05)",color:"rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:20,padding:"5px 12px",cursor:"pointer",fontSize:11}},"← Projects"),
+        h("button",{onClick:handleLogout,style:{background:"transparent",color:"rgba(255,255,255,0.3)",border:"none",padding:5,cursor:"pointer",fontSize:11}},"Sign out")
+      )
+    ),
+
+    // ══ tabs
+    h("div",{style:{background:"rgba(10,8,23,0.7)",borderBottom:"1px solid rgba(255,255,255,0.05)",display:"flex",padding:"0 12px",gap:2,flexShrink:0}},
+      [
+        {id:"build",label:"🤖 Build Report"},
+        {id:"files",label:"📁 Files"+(files.length?" ("+doneFiles+"/"+files.length+")":"")},
+        {id:"demo",label:"🎮 Live Demo",disabled:!demoHTML},
+        {id:"log",label:"📟 Agent Log"}
+      ].map(function(tab){
+        var dis=tab.disabled;
+        return h("button",{key:tab.id,onClick:function(){if(!dis)setActiveTab(tab.id);},style:{padding:"8px 14px",border:"none",background:activeTab===tab.id?"rgba(139,92,246,0.15)":"transparent",color:dis?"rgba(255,255,255,0.15)":activeTab===tab.id?"#a78bfa":"rgba(255,255,255,0.5)",borderRadius:8,cursor:dis?"not-allowed":"pointer",fontSize:11,fontWeight:700,marginTop:4,marginBottom:4}},tab.label);
+      })
+    ),
+
+    error&&h("div",{style:{background:"rgba(239,68,68,0.08)",borderBottom:"1px solid rgba(239,68,68,0.2)",padding:"7px 16px",fontSize:11,color:"#fca5a5",display:"flex",justifyContent:"space-between",flexShrink:0}},
+      h("span",null,"⚠ "+error),
+      h("button",{onClick:function(){setError("");},style:{background:"none",border:"none",color:"#fca5a5",cursor:"pointer"}},"×")
+    ),
+
+    // ══ content
+    h("div",{style:{flex:1,overflow:"hidden",display:"flex"}},
+
+      // BUILD REPORT TAB
+      activeTab==="build"&&h("div",{style:{flex:1,overflowY:"auto",padding:20}},
+        proj&&h("div",{style:{maxWidth:760,margin:"0 auto"}},
+          // raw prompt bubble
+          h("div",{style:{display:"flex",flexDirection:"row-reverse",gap:10,marginBottom:16}},
+            h("div",{style:{width:32,height:32,flexShrink:0,background:"linear-gradient(135deg,rgba(139,92,246,0.15),rgba(99,102,241,0.1))",border:"1px solid rgba(139,92,246,0.25)",color:"#e2e8f0",borderRadius:"16px 4px 16px 16px",padding:"10px 14px",fontSize:13}},proj.rawPrompt)
+          ),
+          // agent card
+          h("div",{style:{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(139,92,246,0.2)",borderRadius:16,overflow:"hidden",marginBottom:16}},
+            h("div",{style:{background:"linear-gradient(135deg,rgba(139,92,246,0.15),rgba(99,102,241,0.08))",padding:"13px 16px",display:"flex",alignItems:"center",gap:10,borderBottom:"1px solid rgba(139,92,246,0.12)"}},
+              h("div",{style:{width:32,height:32,borderRadius:9,background:"linear-gradient(135deg,#8b5cf6,#6366f1)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}},"⚡"),
+              h("div",null,
+                h("div",{style:{color:"#fff",fontWeight:800,fontSize:13}},"Nexevel AI Agent"),
+                h("div",{style:{color:"rgba(255,255,255,0.4)",fontSize:10}},building?"Building your software...":proj.stage==="done"?"Build complete — all steps editable":"Ready")
+              ),
+              proj.stage==="done"&&!building&&h("div",{style:{marginLeft:"auto",background:"rgba(16,185,129,0.1)",border:"1px solid rgba(16,185,129,0.3)",borderRadius:10,padding:"4px 12px",fontSize:10,color:"#10b981",fontWeight:700}},"✓ Complete")
+            ),
+            h("div",{style:{padding:"14px 16px"}},
+              buildSteps.map(function(step){
+                var canEdit = !building&&step.status==="done"&&["refine","spec","plan"].indexOf(step.id)>=0;
+                return h(StepCard,{key:step.id,step:step,onEdit:canEdit?function(){openEdit(step.id);}:null});
+              })
+            ),
+            proj.stage==="done"&&!building&&h("div",{style:{borderTop:"1px solid rgba(255,255,255,0.05)",padding:"12px 16px",display:"flex",gap:8,flexWrap:"wrap"}},
+              demoHTML&&h("button",{onClick:function(){setActiveTab("demo");},style:{background:"linear-gradient(135deg,rgba(16,185,129,0.15),rgba(5,150,105,0.1))",color:"#10b981",border:"1px solid rgba(16,185,129,0.3)",borderRadius:9,padding:"8px 14px",cursor:"pointer",fontSize:11,fontWeight:700}},"🎮 Open Demo"),
+              files.length>0&&h("button",{onClick:function(){setActiveTab("files");},style:{background:"rgba(139,92,246,0.1)",color:"#a78bfa",border:"1px solid rgba(139,92,246,0.25)",borderRadius:9,padding:"8px 14px",cursor:"pointer",fontSize:11,fontWeight:700}},"📁 View "+files.length+" Files"),
+              h("button",{onClick:function(){setScreen("home");},style:{background:"rgba(255,255,255,0.05)",color:"rgba(255,255,255,0.5)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:9,padding:"8px 14px",cursor:"pointer",fontSize:11,fontWeight:700}},"+ New Build")
+            )
+          ),
+          proj.refinedPrompt&&h("div",{style:{background:"rgba(16,185,129,0.05)",border:"1px solid rgba(16,185,129,0.15)",borderRadius:12,padding:"14px 16px",marginBottom:12}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:"#10b981",marginBottom:6,textTransform:"uppercase",letterSpacing:1}},"✨ AI-Refined Prompt"),
+            h("div",{style:{fontSize:12,color:"rgba(255,255,255,0.7)",lineHeight:1.7}},proj.refinedPrompt),
+            proj.refineReport&&h("div",{style:{marginTop:10,display:"flex",gap:8,flexWrap:"wrap"}},
+              (proj.refineReport.keyFeatures||[]).map(function(f,i){
+                return h("span",{key:i,style:{fontSize:10,background:"rgba(16,185,129,0.1)",color:"#10b981",border:"1px solid rgba(16,185,129,0.2)",borderRadius:20,padding:"2px 9px",fontWeight:600}},f);
+              })
+            )
+          )
         )
       ),
 
-      // INPUT BAR
-      CE("div", { style: { background: "rgba(5,3,20,0.9)", borderTop: "1px solid rgba(139,92,246,0.15)", padding: "12px 16px", maxWidth: atab === "demo" ? "100%" : 700, margin: "0 auto", width: "100%", flexShrink: 0, backdropFilter: "blur(20px)" } },
-        phase === "done" && CE("div", { style: { marginBottom: 10, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.15)", borderRadius: 10, padding: "7px 14px", fontSize: 11.5, color: "rgba(16,185,129,0.8)", fontWeight: 500, display: "flex", alignItems: "center", gap: 8 } },
-          CE("span", { style: { color: "#10b981" } }, "◎"),
-          "Build complete! Modify the demo or run deploy.sh to ship.",
-          demoHTML && CE("button", { onClick: function () { setAtab("demo"); }, style: { marginLeft: "auto", background: "rgba(16,185,129,0.1)", color: "#10b981", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 8, padding: "3px 10px", cursor: "pointer", fontSize: 11, fontWeight: 600, whiteSpace: "nowrap" } }, "Open Demo")
-        ),
-        atts.length > 0 && CE("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 } },
-          atts.map(function (a, i) {
-            return CE("div", { key: i, style: { position: "relative", borderRadius: 8, overflow: "hidden", border: "1px solid rgba(139,92,246,0.3)", background: "rgba(139,92,246,0.05)" } },
-              a.type && a.type.indexOf("image/") === 0 ? CE("img", { src: a.dataUrl, alt: a.name, style: { width: 52, height: 52, objectFit: "cover", display: "block" } }) : CE("div", { style: { width: 52, height: 52, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2, color: "#a78bfa" } }, CE("span", { style: { fontSize: 18 } }, "◻"), CE("span", { style: { fontSize: 7 } }, a.name.slice(0, 8))),
-              CE("button", { onClick: function () { removeAtt(i); }, style: { position: "absolute", top: 2, right: 2, width: 14, height: 14, borderRadius: "50%", background: "rgba(0,0,0,0.8)", color: "rgba(255,255,255,0.7)", border: "none", cursor: "pointer", fontSize: 9, display: "flex", alignItems: "center", justifyContent: "center" } }, "×")
-            );
-          })
-        ),
-        CE(GlowInput, null,
-          CE("div", { style: { display: "flex", gap: 6, alignItems: "flex-end", padding: "4px 4px 4px 8px" } },
-            CE("input", { ref: fileInputRef, type: "file", multiple: true, accept: "image/*,.fig,.pdf,.sketch,.xd,.svg", style: { display: "none" }, onChange: handleFileAttach }),
-            CE("button", { onClick: function () { if (fileInputRef.current) fileInputRef.current.click(); }, disabled: busy, style: { width: 32, height: 32, borderRadius: 8, border: "1px dashed rgba(139,92,246,0.3)", background: "transparent", cursor: busy ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(139,92,246,0.5)", fontSize: 16, flexShrink: 0, position: "relative", transition: "all .2s" } },
-              "+",
-              atts.length > 0 && CE("span", { style: { position: "absolute", top: -5, right: -5, width: 14, height: 14, borderRadius: "50%", background: "#8b5cf6", color: "#fff", fontSize: 8, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" } }, atts.length)
-            ),
-            CE("textarea", { value: inp, onChange: function (e) { setInp(e.target.value); }, onKeyDown: function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }, placeholder: busy ? (curPhase ? curPhase.label + "..." : "Working...") : phase === "done" && demoHTML ? "Modify the demo (add dark mode, new module, color theme)..." : "Describe your POS/ERP system in detail...", disabled: busy, rows: 2, style: { flex: 1, border: "none", background: "transparent", resize: "none", fontSize: 13, color: "#e2e8f0", lineHeight: 1.6, fontFamily: "'Inter',sans-serif", maxHeight: 100, overflowY: "auto", padding: "8px 4px" } }),
-            CE("button", { onClick: send, disabled: busy || (!inp.trim() && atts.length === 0), style: { background: (busy || (!inp.trim() && atts.length === 0)) ? "rgba(255,255,255,0.04)" : "linear-gradient(135deg,#8b5cf6,#6366f1)", color: (busy || (!inp.trim() && atts.length === 0)) ? "rgba(255,255,255,0.2)" : "#fff", border: "none", borderRadius: 10, padding: "0 18px", height: 38, cursor: (busy || (!inp.trim() && atts.length === 0)) ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 800, display: "flex", alignItems: "center", gap: 5, flexShrink: 0, whiteSpace: "nowrap", boxShadow: (busy || (!inp.trim() && atts.length === 0)) ? "none" : "0 0 20px rgba(139,92,246,0.4)", transition: "all .2s" } },
-              busy ? CE("div", { style: { width: 14, height: 14, border: "2px solid rgba(255,255,255,0.3)", borderTop: "2px solid #fff", borderRadius: "50%", animation: "spin .8s linear infinite" } }) : "Generate"
+      // FILES TAB
+      activeTab==="files"&&h("div",{style:{width:220,background:"rgba(10,8,23,0.8)",borderRight:"1px solid rgba(139,92,246,0.08)",overflowY:"auto",flexShrink:0}},
+        h("div",{style:{padding:"9px 12px",fontSize:9,fontWeight:700,color:"rgba(255,255,255,0.25)",textTransform:"uppercase",letterSpacing:1.5,borderBottom:"1px solid rgba(255,255,255,0.04)"}},"Project Files"),
+        files.length===0&&h("div",{style:{padding:16,fontSize:11,color:"rgba(255,255,255,0.2)",textAlign:"center"}},"Files appear\nduring build"),
+        files.map(function(file,idx){
+          var sc2=file.status==="done"?"#10b981":file.status==="writing"?"#f59e0b":file.status==="error"?"#ef4444":"rgba(255,255,255,0.2)";
+          var si2=file.status==="done"?"✓":file.status==="writing"?"◌":file.status==="error"?"✕":"○";
+          return h("div",{key:idx,onClick:function(){setActiveFileIdx(idx);},style:{padding:"7px 12px",cursor:"pointer",borderBottom:"1px solid rgba(255,255,255,0.03)",background:activeFileIdx===idx?"rgba(139,92,246,0.1)":"transparent",display:"flex",alignItems:"center",gap:7}},
+            h("span",{style:{fontSize:9,color:sc2,fontWeight:700,flexShrink:0}},si2),
+            h("div",{style:{flex:1,minWidth:0}},
+              h("div",{style:{fontSize:10,color:activeFileIdx===idx?"#fff":"rgba(255,255,255,0.5)",fontFamily:"monospace",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},file.path.split("/").pop()),
+              h("div",{style:{fontSize:8,color:"rgba(255,255,255,0.2)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},file.path)
             )
-          )
+          );
+        })
+      ),
+
+      activeTab==="files"&&h("div",{style:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:"rgba(8,6,20,0.97)"}},
+        curFile
+          ?h("div",{style:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}},
+              h("div",{style:{background:"rgba(10,8,23,0.9)",padding:"7px 14px",display:"flex",alignItems:"center",gap:8,borderBottom:"1px solid rgba(139,92,246,0.08)",flexShrink:0}},
+                h("span",{style:{fontFamily:"monospace",fontSize:11,color:"rgba(255,255,255,0.6)"}},"📄 "+curFile.path),
+                h("span",{style:{fontSize:8,padding:"2px 7px",borderRadius:7,fontWeight:700,background:curFile.status==="done"?"rgba(16,185,129,0.15)":curFile.status==="writing"?"rgba(245,158,11,0.15)":"rgba(239,68,68,0.15)",color:curFile.status==="done"?"#10b981":curFile.status==="writing"?"#f59e0b":"#ef4444"}},curFile.status.toUpperCase()),
+                curFile.code&&curFile.status==="done"&&h("div",{style:{marginLeft:"auto",display:"flex",gap:6}},
+                  h(CopyBtn,{text:curFile.code,label:"Copy"}),
+                  !building&&h("button",{onClick:function(){
+                    setEditModal({stepId:"file_"+activeFileIdx,title:"Edit "+curFile.path,hint:"Edit the code and click Save & Rebuild to regenerate this file",value:curFile.code,
+                      onSave:async function(v){
+                        var p=Object.assign({},currentProject);
+                        p.files=p.files.slice();
+                        p.files[activeFileIdx]=Object.assign({},p.files[activeFileIdx],{code:v,status:"done"});
+                        saveProject(p);setCurrentProject(p);
+                        setEditModal(null);
+                        addLog("File "+curFile.path+" manually updated","success");
+                      }
+                    });
+                  },style:{background:"rgba(139,92,246,0.12)",color:"#a78bfa",border:"1px solid rgba(139,92,246,0.25)",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:10,fontWeight:700}},"✏ Edit")
+                )
+              ),
+              h("div",{style:{flex:1,overflowY:"auto",padding:14}},
+                curFile.status==="writing"&&h("div",{style:{display:"flex",alignItems:"center",gap:8,color:"#f59e0b",fontSize:12,padding:16}},h(Spinner,{size:13,color:"#f59e0b"}),h("span",null,"Writing with Claude AI...")),
+                curFile.code&&h("pre",{style:{color:"rgba(210,210,255,0.9)",fontSize:11,lineHeight:1.65,fontFamily:"monospace",margin:0,whiteSpace:"pre-wrap",wordBreak:"break-word"}},curFile.code)
+              )
+            )
+          :h("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:8,color:"rgba(255,255,255,0.2)",fontSize:12}},
+              h("div",{style:{fontSize:32}},"📁"),
+              h("span",null,"Select a file to view")
+            )
+      ),
+
+      // DEMO TAB
+      activeTab==="demo"&&h("div",{style:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}},
+        h("div",{style:{background:"rgba(10,8,23,0.95)",padding:"5px 12px",display:"flex",alignItems:"center",gap:8,borderBottom:"1px solid rgba(255,255,255,0.04)",flexShrink:0}},
+          h("div",{style:{display:"flex",gap:4}},["#ff5f57","#febc2e","#28c840"].map(function(c,i){return h("div",{key:i,style:{width:10,height:10,borderRadius:"50%",background:c}});})),
+          h("div",{style:{flex:1,background:"rgba(255,255,255,0.04)",borderRadius:7,padding:"3px 10px",fontSize:10,color:"rgba(255,255,255,0.35)",fontFamily:"monospace"}},
+            demoHTML&&h("span",{style:{color:"#10b981",marginRight:7}},"● LIVE"),
+            proj&&proj.appName?proj.appName.toLowerCase().replace(/\s+/g,"-")+".nexevel.ai":"app.nexevel.ai"
+          ),
+          demoHTML&&h(CopyBtn,{text:demoHTML,label:"Copy HTML"})
         ),
-        CE("div", { style: { marginTop: 6, fontSize: 10, color: "rgba(255,255,255,0.15)", display: "flex", alignItems: "center", gap: 6, paddingLeft: 2 } },
-          CE("span", { style: { color: "rgba(139,92,246,0.5)" } }, "⚡"),
-          "Attach PNG / Figma / SVG for UI reference"
-        )
+        demoHTML
+          ?h("iframe",{key:demoHTML.length,srcDoc:demoHTML,title:"Demo",style:{flex:1,border:"none",width:"100%"},sandbox:"allow-scripts allow-same-origin allow-forms allow-modals"})
+          :h("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:8,color:"rgba(255,255,255,0.2)"}},h("div",{style:{fontSize:32}},"🎮"),h("span",{style:{fontSize:12}},"Demo appears after build completes"))
+      ),
+
+      // LOG TAB
+      activeTab==="log"&&h("div",{style:{flex:1,overflowY:"auto",padding:16,fontFamily:"monospace"}},
+        h("div",{style:{fontSize:9,fontWeight:700,color:"rgba(255,255,255,0.25)",marginBottom:10,textTransform:"uppercase",letterSpacing:1.5}},"Agent Build Log — "+buildLog.length+" entries"),
+        buildLog.length===0&&h("div",{style:{color:"rgba(255,255,255,0.2)",fontSize:11,padding:8}},"No log entries yet. Start a build to see activity."),
+        buildLog.map(function(entry,i){return h(LogEntry,{key:i,entry:entry});})
       )
     )
   );

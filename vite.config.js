@@ -10,8 +10,9 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api\/anthropic/, ''),
         headers: {
-          'x-api-key': 'YOUR_KEY_HERE',
+          'x-api-key': process.env.ANTHROPIC_API_KEY || '',
           'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
         },
       },
     },

@@ -2,6 +2,99 @@ import { useState, useRef, useCallback } from "react";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ── Claude API ────────────────────────────────────────────────────────────────
+async function callClaude(userMsg, onChunk, maxTokens, signal) {
+  const res = await fetch("/api/anthropic/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: maxTokens,
+      stream: true,
+      messages: [{ role: "user", content: userMsg }],
+    }),
+    signal,
+  });
+  if (!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", full = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n"); buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const js = t.slice(5).trim();
+      if (js === "[DONE]") continue;
+      try {
+        const p = JSON.parse(js);
+        if (p.type === "content_block_delta" && p.delta?.type === "text_delta") {
+          full += p.delta.text; onChunk?.(full);
+        }
+      } catch {}
+    }
+  }
+  return full;
+}
+
+async function safeCall(prompt, onChunk, maxTokens, setRetry, signal) {
+  for (let i = 0; i < 3; i++) {
+    try { return await callClaude(prompt, onChunk, maxTokens, signal); }
+    catch (e) {
+      if (e.name === "AbortError") throw e;
+      if (e.message.includes("429") && i < 2) {
+        const w = [30, 60][i];
+        setRetry?.(`Rate limit — retrying in ${w}s…`);
+        await sleep(w * 1000);
+        setRetry?.("");
+      } else if (i < 2) {
+        setRetry?.("Error — retrying…");
+        await sleep(3000);
+        setRetry?.("");
+      } else throw e;
+    }
+  }
+}
+
+async function cp(t) {
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function extractJSON(text) {
+  if (!text || typeof text !== "string") return null;
+  const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  const firstBrace = cleaned.search(/[\[{]/);
+  if (firstBrace === -1) return null;
+  const payload = cleaned.slice(firstBrace);
+  let depth = 0, inStr = false, esc = false, end = -1;
+  for (let i = 0; i < payload.length; i++) {
+    const c = payload[i];
+    if (esc) { esc = false; continue; }
+    if (c === "\\") { esc = true; continue; }
+    if (c === '"') inStr = !inStr;
+    if (inStr) continue;
+    if (c === "{" || c === "[") depth++;
+    if (c === "}" || c === "]") { depth--; if (depth === 0) { end = i + 1; break; } }
+  }
+  if (end === -1) return null;
+  try { return JSON.parse(payload.slice(0, end)); } catch { return null; }
+}
+
+function extractCodeBlock(text) {
+  if (!text || typeof text !== "string") return "";
+  const m = text.match(/```[\w.\-/]*\s*\n([\s\S]*?)```/);
+  if (m) return m[1].trim();
+  return text.trim();
+}
+
 // STAGE PROMPTS
 // ════════════════════════════════════════════════════════════════════════════
 
